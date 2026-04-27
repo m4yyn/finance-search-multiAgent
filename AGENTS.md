@@ -2,7 +2,7 @@
 
 ## 项目目标
 
-本项目从零构建“金融行业信息报告编写 Agent 助手”。当前阶段只搭建后端代码骨架与运行环境，不实现具体业务逻辑、Agent 推理链路、RAG 流程或报告生成逻辑。
+本项目从零构建“金融行业信息报告编写 Agent 助手”。当前后端已具备 FastAPI 骨架、配置读取、PostgreSQL ORM、Redis 工具、JWT 鉴权、用户注册登录、聊天会话、流式 LLM 回复与 Alembic 迁移基础。后续实现 Agent、RAG、报告生成或数据处理逻辑时，必须沿用现有分层关系，不得绕过 service/router/schema/core 边界。
 
 ## 目录约束
 
@@ -26,6 +26,9 @@
 
 ```text
 backend/
+  alembic/               # Alembic 迁移环境与版本文件
+    env.py               # 动态读取 backend/.env 中的 DATABASE_URL，并注入 ORM metadata
+    versions/            # 数据库迁移版本；模型变更必须新增迁移
   app/
     config/              # 配置文件与环境变量读取
     core/                # 数据库配置、会话管理、密钥哈希等基础设施层
@@ -38,6 +41,60 @@ backend/
   .venv/                 # 后端专用 Python 虚拟环境，本地生成，不提交
 ```
 
+## 后端系统结构与文件关系
+
+后端调用链遵循以下方向：
+
+```text
+app/config/settings.py
+  -> app/core/*                 # 数据库、Redis、JWT、OpenAI、Milvus 等基础设施
+  -> app/models/*               # ORM 表结构，统一挂载到 app.core.database.Base.metadata
+  -> app/schemas/*              # 请求与响应契约
+  -> app/service/*              # 业务规则与数据库读写
+  -> app/router/*               # HTTP 接口、依赖注入、状态码与异常转换
+  -> app/main.py                # FastAPI 实例创建与路由挂载
+```
+
+- `app/core/database.py` 是 ORM 与迁移的中心：定义 `Base`、异步 engine、sessionmaker、`get_db()`。所有模型必须继承这里的 `Base`。
+- `app/models/__init__.py` 必须导入所有 ORM 模型，确保 Alembic 在 `alembic/env.py` 中通过 `import app.models` 能拿到完整 metadata。
+- `alembic/env.py` 必须从 `app.config.settings.get_settings()` 动态读取 `DATABASE_URL`/PostgreSQL 配置，不允许写死数据库地址。
+- `app/schemas/*` 只定义 API 输入输出，不直接访问数据库。
+- `app/service/*` 承载业务规则和数据库查询；router 不应直接堆叠复杂 SQL 或业务判断。
+- `app/router/api.py` 只聚合 `/api/v1` 下的业务路由；`app/main.py` 负责挂载 `/health` 和带前缀的 API 路由。
+- `app/core/redis_client.py` 提供 Redis 连接池与 `RedisCache`，认证会话、缓存和队列类能力都应优先复用该工具。
+- `app/core/security.py` 提供 bcrypt 密码哈希与 python-jose JWT 编解码；认证相关代码不得在其他文件重复实现加密或 token 逻辑。
+- `app/schemas/user.py` 是用户注册、登录、用户响应和 token 响应的标准 API 契约入口；`app/schemas/auth.py` 仅保留兼容重导出。
+- `app/router/auth_router.py` 是认证接口的标准路由入口；`app/router/auth.py` 仅保留兼容重导出。
+- `app/models/chat.py` 定义聊天会话与消息表；PG 保存完整历史，Redis 只保存短期上下文窗口。
+- `app/service/session_service.py` 负责聊天会话、消息持久化、Redis 短期记忆裁剪与 OpenAI messages 格式化。
+- `app/service/chat_service.py` 负责普通聊天的完整流式编排，串联 ORM、Redis、LLM 与结构化 SSE 输出。
+- `app/service/llm_service.py` 是临时 OpenAI streaming 封装，后续可被 Agent/Deep Research 编排替换。
+- `app/router/chat_router.py` 是聊天接口入口，发送消息接口使用结构化 JSON SSE。
+
+## 模块索引
+
+| 模块 | 职责 | 上游依赖 | 下游影响 |
+| --- | --- | --- | --- |
+| `backend/app/config/` | 读取 `.env` 和环境变量，产出统一 settings 对象 | `backend/.env`、部署环境变量、`backend/.env.example` | `core/*`、`alembic/env.py`、应用启动配置 |
+| `backend/app/core/` | 基础设施层：数据库、Redis、JWT/密码、OpenAI、Milvus、会话工具 | `config/settings.py`、第三方 SDK | `models`、`service`、`router`、测试 fixture |
+| `backend/app/models/` | PostgreSQL ORM 表结构，统一挂载到 `Base.metadata` | `core/database.py` | Alembic autogenerate、service 查询、数据库测试 |
+| `backend/app/schemas/` | API 请求与响应契约，禁止返回敏感字段如 `hashed_password` | 接口需求、Pydantic | router `response_model`、service 入参、接口测试 |
+| `backend/app/service/` | 业务规则、数据库读写、认证领域逻辑 | `models`、`schemas`、`core` | router 状态码转换、业务测试 |
+| `backend/app/service/deep_research/` | 后续 Agent、Deep Research、RAG 与报告生成核心编排 | `core` 客户端、领域 service | router/API、任务队列、报告生成测试 |
+| `backend/app/router/` | HTTP 边界：路由、依赖注入、鉴权依赖、异常与状态码 | `schemas`、`service`、`core` | `app/main.py` 路由挂载、TestClient 接口测试 |
+| `backend/alembic/` | 数据库迁移环境和版本脚本 | `config/settings.py`、`models/__init__.py`、`Base.metadata` | 本机 PostgreSQL schema、迁移测试 |
+| `backend/tests/` | 验证配置、ORM、迁移、Redis、安全工具、认证接口 | 应用代码与测试 fixture | 回归质量门槛，修改代码后必须同步更新 |
+
+## 修改前阅读索引
+
+- 改认证接口或用户 API：先读 `backend/app/schemas/user.py` -> `backend/app/core/security.py` -> `backend/app/core/redis_client.py` -> `backend/app/service/auth_service.py` -> `backend/app/router/auth_router.py` -> `backend/tests/test_auth.py`。
+- 改用户表或数据库字段：先读 `backend/app/core/database.py` -> `backend/app/models/user.py` -> `backend/app/models/__init__.py` -> `backend/alembic/env.py` -> `backend/alembic/versions/*` -> `backend/tests/test_user_model.py` -> `backend/tests/test_alembic_config.py`。
+- 改聊天会话、消息或流式回复：先读 `backend/app/models/chat.py` -> `backend/app/schemas/chat.py` -> `backend/app/service/session_service.py` -> `backend/app/service/chat_service.py` -> `backend/app/service/llm_service.py` -> `backend/app/router/chat_router.py` -> `backend/tests/test_chat_service.py` -> `backend/tests/test_chat_router.py`。
+- 改配置或环境变量：先读 `backend/.env.example` -> `backend/app/config/settings.py` -> 相关 `backend/app/core/*` 客户端 -> `backend/alembic/env.py` -> 对应测试。
+- 改业务服务：先读对应 `schemas` 和 `models` -> `backend/app/service/*` -> 调用它的 `router` -> 对应测试。
+- 改路由挂载或 API 前缀：先读 `backend/app/router/api.py` -> `backend/app/main.py` -> `backend/app/config/settings.py` -> 接口测试。
+- 改 Agent/Deep Research 逻辑：先读 `backend/app/service/deep_research/` -> 需要的 `core` 客户端 -> 未来任务/报告相关 router 和测试；不得从 `reference/` 直接导入。
+
 ## 当前骨架运行方式
 
 在 `backend/` 目录中使用专用虚拟环境：
@@ -47,10 +104,42 @@ source .venv/bin/activate
 uvicorn app.main:app --reload
 ```
 
-健康检查接口：
+常用接口：
 
 ```text
 GET /health
+POST /api/v1/auth/register
+POST /api/v1/auth/login
+GET /api/v1/auth/me
+POST /api/v1/auth/logout
+POST /api/v1/chat/sessions
+GET /api/v1/chat/sessions/{session_id}
+POST /api/v1/chat/sessions/{session_id}/messages
+```
+
+数据库迁移：
+
+```bash
+cd backend
+source .venv/bin/activate
+alembic upgrade head
+```
+
+验收测试：
+
+```bash
+cd backend
+.venv/bin/python -m pytest tests/test_acceptance_smoke.py -q
+.venv/bin/python -m pytest -q
+```
+
+`tests/test_acceptance_smoke.py` 覆盖真实 PostgreSQL 连接、Redis 读写、密码哈希、JWT、ORM 导入、Alembic 当前版本、`users` 表、4 个用户 schema、OpenAPI 文档中的 `/auth/*` 路径、CORS 预检，以及注册/重复注册/错密码/正确登录/无 token `/me`/带 token `/me`/数据库密码哈希。
+
+聊天模块专项测试：
+
+```bash
+cd backend
+.venv/bin/python -m pytest tests/test_chat_model.py tests/test_chat_schemas.py tests/test_session_service.py tests/test_chat_service.py tests/test_llm_service.py tests/test_chat_router.py -q
 ```
 
 ## 编码规范
@@ -65,6 +154,37 @@ GET /health
 - 外部资源连接必须延迟初始化或显式初始化，不能让应用导入阶段依赖本地必须运行 PostgreSQL、Redis 或 Milvus。
 - 不在代码中硬编码 API key、数据库密码或其他密钥；使用 `.env` 或部署环境变量。
 - 新增行为应配套最小测试，至少覆盖导入、路由注册和核心契约。
+
+## 联动修改规则
+
+- 修改 `app/models/*`：
+  - 同步更新 `app/models/__init__.py`
+  - 新增或调整 Alembic migration
+  - 增加/更新模型测试和迁移测试
+- 修改 `app/config/settings.py` 或环境变量：
+  - 同步更新 `backend/.env.example`
+  - 检查 `app/core/database.py`、`app/core/redis_client.py`、`app/core/openai_client.py`、`app/core/milvus.py`
+  - 检查 `alembic/env.py` 是否仍能读取正确数据库 URL
+- 修改认证、JWT、密码或会话逻辑：
+  - 同步检查 `app/schemas/user.py`、`app/core/security.py`、`app/core/redis_client.py`、`app/service/auth_service.py`、`app/router/auth_router.py`
+  - 仅在兼容导出变化时更新 `app/schemas/auth.py` 和 `app/router/auth.py`
+  - 更新注册、登录、鉴权、Redis session 与密码哈希测试
+- 修改聊天会话、消息、Redis 短期记忆或 SSE：
+  - 同步检查 `app/models/chat.py`、`app/schemas/chat.py`、`app/service/session_service.py`、`app/service/chat_service.py`、`app/service/llm_service.py`、`app/router/chat_router.py`
+  - 模型字段变化必须新增 Alembic migration
+  - 更新模型、schema、service、LLM stream 和 chat router 测试
+- 修改 API schema：
+  - 同步检查对应 router 的 request/response_model
+  - 同步检查 service 入参与返回值
+  - 保持接口错误状态码一致
+- 修改 router：
+  - 确认是否需要在 `app/router/api.py` 注册
+  - 确认 `app/main.py` 的前缀挂载不被破坏
+  - 添加 FastAPI TestClient 覆盖
+- 修改 Alembic：
+  - 确认 `alembic heads` 只有预期 head
+  - 确认 `alembic upgrade head` 可在目标数据库执行
+  - 确认迁移结果与 ORM 模型一致
 
 ## 环境变量约定
 

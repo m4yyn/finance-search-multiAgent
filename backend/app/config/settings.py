@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     app_env: str = "local"
     debug: bool = True
     api_v1_prefix: str = "/api/v1"
+    cors_allowed_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    cors_allow_credentials: bool = True
 
     postgres_host: str = "localhost"
     postgres_port: int = 5432
@@ -44,6 +46,14 @@ class Settings(BaseSettings):
     jwt_access_token_expire_minutes: int = 1440
 
     upload_dir: str = "./data/uploads"
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [
+            origin.strip()
+            for origin in self.cors_allowed_origins.split(",")
+            if origin.strip()
+        ]
 
     @property
     def postgres_dsn(self) -> str:

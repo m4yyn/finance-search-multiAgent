@@ -37,6 +37,7 @@ backend/data/milvus/*
 backend/data/uploads/*
 !backend/data/milvus/.gitkeep
 !backend/data/uploads/.gitkeep
+dump.rdb
 
 # Logs and temporary files
 *.log
