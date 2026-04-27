@@ -7,7 +7,9 @@ from app.schemas.chat import (
     ChatMessageResponse,
     ChatSSEChunk,
     ChatSessionCreate,
+    ChatSessionCreatedResponse,
     ChatSessionResponse,
+    ChatStreamRequest,
     SendMessageRequest,
 )
 
@@ -19,6 +21,8 @@ def test_chat_schemas_validate_expected_fields() -> None:
 
     create_payload = ChatSessionCreate(title="  投资  研究  ")
     send_payload = SendMessageRequest(content="  分析银行板块  ")
+    stream_payload = ChatStreamRequest(session_id=session_id, content="  分析贵州茅台  ")
+    created_response = ChatSessionCreatedResponse(session_id=session_id, title="投资研究")
     session_response = ChatSessionResponse(
         id=session_id,
         user_id=user_id,
@@ -44,6 +48,8 @@ def test_chat_schemas_validate_expected_fields() -> None:
 
     assert create_payload.title == "投资 研究"
     assert send_payload.content == "分析银行板块"
+    assert stream_payload.content == "分析贵州茅台"
+    assert created_response.session_id == session_id
     assert session_response.user_id == user_id
     assert message_response.role == "assistant"
     assert chunk.done is False

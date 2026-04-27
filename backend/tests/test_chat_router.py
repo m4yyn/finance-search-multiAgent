@@ -175,7 +175,7 @@ def parse_sse_events(response_text: str) -> list[dict]:
 def test_chat_router_requires_authentication(chat_client) -> None:
     client, _, _, _, _ = chat_client
 
-    response = client.post("/api/v1/chat/sessions", json={})
+    response = client.post("/api/v1/chat/session", json={})
 
     assert response.status_code == 401
 
@@ -184,17 +184,19 @@ def test_chat_router_creates_reads_and_streams_messages(chat_client) -> None:
     client, redis_cache, sessionmaker, owner_token, _ = chat_client
     headers = {"Authorization": f"Bearer {owner_token}"}
 
-    create_response = client.post("/api/v1/chat/sessions", json={}, headers=headers)
+    create_response = client.post("/api/v1/chat/session", json={}, headers=headers)
     assert create_response.status_code == 201
-    session_id = create_response.json()["id"]
+    session_id = create_response.json()["session_id"]
     assert create_response.json()["title"] == "新会话"
 
-    read_response = client.get(f"/api/v1/chat/sessions/{session_id}", headers=headers)
-    assert read_response.status_code == 200
+    sessions_response = client.get("/api/v1/chat/sessions", headers=headers)
+    assert sessions_response.status_code == 200
+    assert len(sessions_response.json()) == 1
+    assert sessions_response.json()[0]["id"] == session_id
 
     stream_response = client.post(
-        f"/api/v1/chat/sessions/{session_id}/messages",
-        json={"content": "请分析银行股"},
+        "/api/v1/chat/stream",
+        json={"session_id": session_id, "content": "请分析银行股"},
         headers=headers,
     )
     events = parse_sse_events(stream_response.text)
@@ -228,15 +230,44 @@ def test_chat_router_creates_reads_and_streams_messages(chat_client) -> None:
     assert messages[1].content == "银行分析"
     assert [message["role"] for message in redis_messages] == ["user", "assistant"]
 
+    messages_response = client.get(
+        f"/api/v1/chat/session/{session_id}/messages",
+        headers=headers,
+    )
+    assert messages_response.status_code == 200
+    assert [message["role"] for message in messages_response.json()] == [
+        "user",
+        "assistant",
+    ]
+
 
 def test_chat_router_hides_other_users_sessions(chat_client) -> None:
     client, _, _, owner_token, other_token = chat_client
     owner_headers = {"Authorization": f"Bearer {owner_token}"}
     other_headers = {"Authorization": f"Bearer {other_token}"}
 
-    create_response = client.post("/api/v1/chat/sessions", json={}, headers=owner_headers)
-    session_id = create_response.json()["id"]
+    create_response = client.post("/api/v1/chat/session", json={}, headers=owner_headers)
+    session_id = create_response.json()["session_id"]
 
-    response = client.get(f"/api/v1/chat/sessions/{session_id}", headers=other_headers)
+    response = client.get(
+        f"/api/v1/chat/session/{session_id}/messages",
+        headers=other_headers,
+    )
 
     assert response.status_code == 404
+
+
+def test_chat_openapi_exposes_exactly_four_chat_paths(chat_client) -> None:
+    client, _, _, _, _ = chat_client
+
+    response = client.get("/openapi.json")
+    chat_paths = {
+        path for path in response.json()["paths"] if path.startswith("/api/v1/chat/")
+    }
+
+    assert chat_paths == {
+        "/api/v1/chat/session",
+        "/api/v1/chat/sessions",
+        "/api/v1/chat/stream",
+        "/api/v1/chat/session/{session_id}/messages",
+    }

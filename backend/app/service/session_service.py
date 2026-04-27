@@ -110,6 +110,21 @@ async def get_chat_session(
     return result.scalar_one_or_none()
 
 
+async def list_chat_sessions(
+    db: AsyncSession,
+    user_id: UUID,
+) -> list[ChatSession]:
+    result = await db.execute(
+        select(ChatSession)
+        .where(
+            ChatSession.user_id == user_id,
+            ChatSession.is_active.is_(True),
+        )
+        .order_by(ChatSession.updated_at.desc(), ChatSession.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
 async def add_message(
     db: AsyncSession,
     redis_cache: RedisCache,

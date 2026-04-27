@@ -5,7 +5,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.redis_client import RedisCache
-from app.models import ChatSession
+from app.models import ChatMessage, ChatSession
 from app.schemas.chat import ChatSSEChunk
 from app.service import llm_service
 from app.service.session_service import (
@@ -13,6 +13,8 @@ from app.service.session_service import (
     create_chat_session,
     get_chat_session,
     get_formatted_history_messages,
+    get_session_messages,
+    list_chat_sessions,
 )
 
 
@@ -35,6 +37,24 @@ async def get_user_chat_session(
     session_id: UUID,
 ) -> ChatSession | None:
     return await get_chat_session(db, user_id, session_id)
+
+
+async def list_user_chat_sessions(
+    db: AsyncSession,
+    user_id: UUID,
+) -> list[ChatSession]:
+    return await list_chat_sessions(db, user_id)
+
+
+async def get_user_chat_messages(
+    db: AsyncSession,
+    user_id: UUID,
+    session_id: UUID,
+) -> list[ChatMessage] | None:
+    chat_session = await get_user_chat_session(db, user_id, session_id)
+    if chat_session is None:
+        return None
+    return await get_session_messages(db, session_id)
 
 
 async def stream_chat_response(

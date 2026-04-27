@@ -123,17 +123,20 @@ def test_real_openai_chat_stream_persists_pg_and_redis(monkeypatch) -> None:
         with TestClient(create_app()) as client:
             headers = {"Authorization": f"Bearer {token}"}
             create_response = client.post(
-                "/api/v1/chat/sessions",
+                "/api/v1/chat/session",
                 json={},
                 headers=headers,
             )
             assert create_response.status_code == 201
-            session_id = create_response.json()["id"]
+            session_id = create_response.json()["session_id"]
 
             with client.stream(
                 "POST",
-                f"/api/v1/chat/sessions/{session_id}/messages",
-                json={"content": "请用一句中文回复：连通性测试"},
+                "/api/v1/chat/stream",
+                json={
+                    "session_id": session_id,
+                    "content": "请用一句中文回复：连通性测试",
+                },
                 headers=headers,
             ) as response:
                 assert response.status_code == 200

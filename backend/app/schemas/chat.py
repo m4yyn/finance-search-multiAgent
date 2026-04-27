@@ -46,6 +46,19 @@ class SendMessageRequest(BaseModel):
         return normalized
 
 
+class ChatSessionCreatedResponse(BaseModel):
+    """Minimal response for chat session creation."""
+
+    session_id: UUID
+    title: str
+
+
+class ChatStreamRequest(SendMessageRequest):
+    """Stream one user message to an existing chat session."""
+
+    session_id: UUID
+
+
 class ChatMessageResponse(BaseModel):
     """Public chat message response."""
 

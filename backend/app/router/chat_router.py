@@ -10,13 +10,17 @@ from app.core.redis_client import RedisCache, get_redis_cache
 from app.models import User
 from app.router.auth_router import get_current_user_required
 from app.schemas.chat import (
+    ChatMessageResponse,
     ChatSessionCreate,
+    ChatSessionCreatedResponse,
     ChatSessionResponse,
-    SendMessageRequest,
+    ChatStreamRequest,
 )
 from app.service.chat_service import (
     create_user_chat_session,
+    get_user_chat_messages,
     get_user_chat_session,
+    list_user_chat_sessions,
     stream_chat_response,
 )
 
@@ -25,43 +29,58 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 
 
 @router.post(
-    "/sessions",
-    response_model=ChatSessionResponse,
+    "/session",
+    response_model=ChatSessionCreatedResponse,
     status_code=status.HTTP_201_CREATED,
 )
 async def create_session(
     payload: ChatSessionCreate,
     current_user: Annotated[User, Depends(get_current_user_required)],
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> ChatSessionResponse:
-    return await create_user_chat_session(db, current_user.id, payload.title)
+) -> ChatSessionCreatedResponse:
+    chat_session = await create_user_chat_session(db, current_user.id, payload.title)
+    return ChatSessionCreatedResponse(
+        session_id=chat_session.id,
+        title=chat_session.title,
+    )
 
 
-@router.get("/sessions/{session_id}", response_model=ChatSessionResponse)
-async def read_session(
+@router.get("/sessions", response_model=list[ChatSessionResponse])
+async def read_sessions(
+    current_user: Annotated[User, Depends(get_current_user_required)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[ChatSessionResponse]:
+    return await list_user_chat_sessions(db, current_user.id)
+
+
+@router.get("/session/{session_id}/messages", response_model=list[ChatMessageResponse])
+async def read_session_messages(
     session_id: UUID,
     current_user: Annotated[User, Depends(get_current_user_required)],
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> ChatSessionResponse:
-    chat_session = await get_user_chat_session(db, current_user.id, session_id)
-    if chat_session is None:
+) -> list[ChatMessageResponse]:
+    messages = await get_user_chat_messages(db, current_user.id, session_id)
+    if messages is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Chat session not found.",
         )
-    return chat_session
+    return messages
 
 
-@router.post("/sessions/{session_id}/messages")
-async def send_message(
-    session_id: UUID,
-    payload: SendMessageRequest,
+@router.post("/stream")
+async def stream_message(
+    payload: ChatStreamRequest,
     current_user: Annotated[User, Depends(get_current_user_required)],
     sessionmaker: Annotated[async_sessionmaker[AsyncSession], Depends(get_sessionmaker)],
     redis_cache: Annotated[RedisCache, Depends(get_redis_cache)],
 ) -> StreamingResponse:
     async with sessionmaker() as db:
-        chat_session = await get_user_chat_session(db, current_user.id, session_id)
+        chat_session = await get_user_chat_session(
+            db,
+            current_user.id,
+            payload.session_id,
+        )
     if chat_session is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -69,7 +88,12 @@ async def send_message(
         )
 
     return StreamingResponse(
-        stream_chat_response(sessionmaker, redis_cache, session_id, payload.content),
+        stream_chat_response(
+            sessionmaker,
+            redis_cache,
+            payload.session_id,
+            payload.content,
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

@@ -112,9 +112,10 @@ POST /api/v1/auth/register
 POST /api/v1/auth/login
 GET /api/v1/auth/me
 POST /api/v1/auth/logout
-POST /api/v1/chat/sessions
-GET /api/v1/chat/sessions/{session_id}
-POST /api/v1/chat/sessions/{session_id}/messages
+POST /api/v1/chat/session
+GET /api/v1/chat/sessions
+POST /api/v1/chat/stream
+GET /api/v1/chat/session/{session_id}/messages
 ```
 
 数据库迁移：
@@ -140,6 +141,14 @@ cd backend
 ```bash
 cd backend
 .venv/bin/python -m pytest tests/test_chat_model.py tests/test_chat_schemas.py tests/test_session_service.py tests/test_chat_service.py tests/test_llm_service.py tests/test_chat_router.py -q
+```
+
+端到端脚本：
+
+```bash
+cd backend
+.venv/bin/python scripts/test_llm.py
+.venv/bin/python scripts/test_chat.py
 ```
 
 ## 编码规范
