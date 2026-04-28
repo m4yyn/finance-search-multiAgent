@@ -8,7 +8,7 @@
 
 - `reference/` 仅作为代码逻辑参考资料，禁止被新项目直接导入、调用、复制或作为运行时依赖。
 - 新后端代码统一放在 `backend/` 下。
-- 除非用户明确要求，不修改 `reference/`、`frontend/`、`data/` 中的内容。
+- 除非用户明确要求，不修改 `reference/`、`data/` 中的内容；当前前端工程统一放在 `frontend/` 下。
 - 后续新增代码应优先遵循 `backend/app/` 的分层结构，避免把业务逻辑写入入口文件。
 
 ## 后端技术栈
@@ -39,6 +39,12 @@ backend/
       deep_research/     # 后续 Agent 核心逻辑函数与 Deep Research 编排
   tests/                 # 后端测试
   .venv/                 # 后端专用 Python 虚拟环境，本地生成，不提交
+frontend/
+  src/api/               # 前端 API client，统一处理 JWT、错误与后端路径
+  src/lib/               # 通用前端工具，例如 SSE parser
+  src/features/          # auth/chat/knowledge 等业务组件与 hooks
+  src/styles/            # 全局主题与布局样式
+  e2e/                   # Playwright 端到端测试
 ```
 
 ## 后端系统结构与文件关系
@@ -65,9 +71,9 @@ app/config/settings.py
 - `app/core/security.py` 提供 bcrypt 密码哈希与 python-jose JWT 编解码；认证相关代码不得在其他文件重复实现加密或 token 逻辑。
 - `app/schemas/user.py` 是用户注册、登录、用户响应和 token 响应的标准 API 契约入口；`app/schemas/auth.py` 仅保留兼容重导出。
 - `app/router/auth_router.py` 是认证接口的标准路由入口；`app/router/auth.py` 仅保留兼容重导出。
-- `app/models/chat.py` 定义聊天会话与消息表；PG 保存完整历史，Redis 只保存短期上下文窗口。
+- `app/models/chat.py` 定义聊天会话与消息表；PG 保存完整历史，Redis 只保存短期上下文窗口；研究记录删除使用 `ChatSession.is_active=False` 软删除，不物理删除 `chat_messages`。
 - `app/models/knowledge.py` 定义知识库与上传文档元数据表；PG 存储知识库、文件路径、文件状态和 chunk 数量，Milvus 存储后续 chunk 向量和 chunk metadata。
-- `app/service/session_service.py` 负责聊天会话、消息持久化、Redis 短期记忆裁剪与 OpenAI messages 格式化。
+- `app/service/session_service.py` 负责聊天会话、研究记录软删除、消息持久化、Redis 短期记忆裁剪与 OpenAI messages 格式化；删除研究记录时必须同步清理 `chat:session:{session_id}:messages`。
 - `app/service/chat_service.py` 负责聊天的完整流式编排，串联 ORM、Redis、LLM 与结构化 SSE 输出；`/chat/stream` 使用 `search_mode` 三态：`none` 纯 LLM，`local` 本地 RAG，`web` Bocha 联网搜索。纯 LLM 普通聊天必须注入 `ORDINARY_CHAT_SYSTEM_PROMPT`，限制其只服务金融研究、资料检索、报告写作和系统使用引导。
 - `app/service/local_file_router_service.py` 负责本地搜索的文件意图识别：读取当前用户已成功入库的非敏感文件元数据，让 LLM 严格输出可校验 JSON，再路由到具体文件、知识库或全库检索。
 - `app/service/llm_service.py` 是临时 OpenAI streaming 封装，后续可被 Agent/Deep Research 编排替换。
@@ -84,6 +90,8 @@ app/config/settings.py
 - `app/router/document_router.py` 是知识库文档上传、列表和删除接口入口，上传后用后台任务触发入库。
 - `app/router/chat_router.py` 是聊天接口入口，发送消息接口使用结构化 JSON SSE。
 - `app/router/search_router.py` 是联网搜索测试接口入口，当前提供 `POST /api/v1/search/web`。
+- `frontend/src/api/` 必须与后端 `/api/v1` 契约保持同步；改后端 schema 或 router 时同步检查前端 types、API client 和 E2E mock。
+- `frontend/src/lib/sse.ts` 是前端流式输出解析中心；改后端 SSE payload 时必须同步更新该 parser、chat UI 和测试。
 
 ## 模块索引
 
@@ -109,6 +117,7 @@ app/config/settings.py
 - 改配置或环境变量：先读 `backend/.env.example` -> `backend/app/config/settings.py` -> 相关 `backend/app/core/*` 客户端 -> `backend/alembic/env.py` -> 对应测试。
 - 改业务服务：先读对应 `schemas` 和 `models` -> `backend/app/service/*` -> 调用它的 `router` -> 对应测试。
 - 改路由挂载或 API 前缀：先读 `backend/app/router/api.py` -> `backend/app/main.py` -> `backend/app/config/settings.py` -> 接口测试。
+- 改前端 API 或页面：先读 `frontend/src/types.ts` -> `frontend/src/api/*` -> 对应 `frontend/src/features/*` -> `frontend/e2e/app.spec.ts`。
 - 改 Agent/Deep Research 逻辑：先读 `backend/app/service/deep_research/` -> 需要的 `core` 客户端 -> 未来任务/报告相关 router 和测试；不得从 `reference/` 直接导入。
 
 ## 当前骨架运行方式
@@ -131,6 +140,7 @@ POST /api/v1/auth/logout
 POST /api/v1/chat/session
 GET /api/v1/chat/sessions
 POST /api/v1/chat/stream
+DELETE /api/v1/chat/session/{session_id}
 GET /api/v1/chat/session/{session_id}/messages
 POST /api/v1/knowledge/bases
 GET /api/v1/knowledge/bases
@@ -222,6 +232,7 @@ cd backend
   - 上传仍按 KnowledgeBase 分类；问答端不暴露高级筛选，具体文件/知识库选择由 `local_file_router_service.py` 自动识别
   - `search_mode="web"` 应调用 `search_service.py` 的 Bocha 搜索，使用 `WEB_SEARCH_PROMPT_TEMPLATE`，最终 `done.references` 返回 `source_type="web"` 的引用
   - Bocha 搜索缓存必须独立使用 `web_search:bocha:` key，不得写入 `chat:session:*:messages`
+  - 删除研究记录必须使用 `is_active=False` 软删除，并清理对应 Redis 短期记忆；不得默认物理删除 PG `chat_messages`
   - RAG 增强 prompt 不得写入 PG/Redis，PG/Redis 只保存用户原始问题和 assistant 回答
   - `ChatSSEChunk.references` 只在最终 `done` 事件中返回，编号必须与 prompt 中 `[编号]` 一致
   - 模型字段变化必须新增 Alembic migration

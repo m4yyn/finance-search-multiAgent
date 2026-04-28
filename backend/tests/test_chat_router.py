@@ -13,7 +13,7 @@ from app.core.database import Base, get_db, get_sessionmaker
 from app.core.redis_client import get_redis_cache
 from app.core.security import create_access_token
 from app.main import create_app
-from app.models import ChatMessage, User
+from app.models import ChatMessage, ChatSession, User
 from app.schemas.knowledge import RetrivalChunk
 from app.schemas.search import WebSearchResponse, WebSearchResult
 from app.service import chat_service, llm_service, session_service
@@ -270,6 +270,55 @@ def test_chat_router_creates_reads_and_streams_messages(chat_client) -> None:
     ]
 
 
+def test_chat_router_deletes_own_session_with_soft_delete_and_redis_cleanup(
+    chat_client,
+) -> None:
+    client, redis_cache, sessionmaker, owner_token, _ = chat_client
+    headers = {"Authorization": f"Bearer {owner_token}"}
+
+    create_response = client.post("/api/v1/chat/session", json={}, headers=headers)
+    session_id = create_response.json()["session_id"]
+    stream_response = client.post(
+        "/api/v1/chat/stream",
+        json={"session_id": session_id, "content": "请分析银行股"},
+        headers=headers,
+    )
+    assert stream_response.status_code == 200
+    assert asyncio.run(
+        redis_cache.exists(session_service.get_chat_redis_key(session_id))
+    )
+
+    delete_response = client.delete(
+        f"/api/v1/chat/session/{session_id}",
+        headers=headers,
+    )
+
+    assert delete_response.status_code == 204
+    assert delete_response.content == b""
+    assert (
+        client.get("/api/v1/chat/sessions", headers=headers).json()
+        == []
+    )
+    assert (
+        client.get(
+            f"/api/v1/chat/session/{session_id}/messages",
+            headers=headers,
+        ).status_code
+        == 404
+    )
+    assert not asyncio.run(
+        redis_cache.exists(session_service.get_chat_redis_key(session_id))
+    )
+
+    async def inspect_session() -> ChatSession | None:
+        async with sessionmaker() as session:
+            return await session.get(ChatSession, UUID(session_id))
+
+    deleted_session = asyncio.run(inspect_session())
+    assert deleted_session is not None
+    assert deleted_session.is_active is False
+
+
 def test_chat_router_streams_with_local_document_route_and_returns_references(
     chat_client,
     monkeypatch,
@@ -461,7 +510,24 @@ def test_chat_router_hides_other_users_sessions(chat_client) -> None:
     assert response.status_code == 404
 
 
-def test_chat_openapi_exposes_exactly_four_chat_paths(chat_client) -> None:
+def test_chat_router_prevents_cross_user_session_deletion(chat_client) -> None:
+    client, _, _, owner_token, other_token = chat_client
+    owner_headers = {"Authorization": f"Bearer {owner_token}"}
+    other_headers = {"Authorization": f"Bearer {other_token}"}
+
+    create_response = client.post("/api/v1/chat/session", json={}, headers=owner_headers)
+    session_id = create_response.json()["session_id"]
+
+    response = client.delete(
+        f"/api/v1/chat/session/{session_id}",
+        headers=other_headers,
+    )
+
+    assert response.status_code == 404
+    assert len(client.get("/api/v1/chat/sessions", headers=owner_headers).json()) == 1
+
+
+def test_chat_openapi_exposes_chat_paths(chat_client) -> None:
     client, _, _, _, _ = chat_client
 
     response = client.get("/openapi.json")
@@ -471,6 +537,7 @@ def test_chat_openapi_exposes_exactly_four_chat_paths(chat_client) -> None:
 
     assert chat_paths == {
         "/api/v1/chat/session",
+        "/api/v1/chat/session/{session_id}",
         "/api/v1/chat/sessions",
         "/api/v1/chat/stream",
         "/api/v1/chat/session/{session_id}/messages",

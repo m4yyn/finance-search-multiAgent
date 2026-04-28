@@ -11,9 +11,12 @@ from app.service import session_service
 from app.service.session_service import (
     add_message,
     create_chat_session,
+    delete_chat_session,
     get_formatted_history_messages,
+    get_chat_session,
     get_session_messages,
     get_short_term_messages,
+    list_chat_sessions,
     prune_short_term_messages,
 )
 
@@ -129,6 +132,36 @@ def test_session_service_rebuilds_redis_from_pg_and_formats_history(monkeypatch)
                 {"role": "assistant", "content": "hi"},
             ]
             assert redis_cache.client.lists
+
+    asyncio.run(run_check())
+
+
+def test_session_service_soft_deletes_session_and_clears_redis(monkeypatch) -> None:
+    async def run_check() -> None:
+        async for db, _, redis_cache, user in build_session():
+            monkeypatch.setattr(session_service, "count_message_tokens", lambda _: 1)
+            chat_session = await create_chat_session(db, user.id, title="研究记录")
+            await add_message(db, redis_cache, chat_session.id, "user", "hello")
+
+            redis_key = session_service.get_chat_redis_key(chat_session.id)
+            assert await redis_cache.exists(redis_key)
+
+            deleted = await delete_chat_session(db, redis_cache, user.id, chat_session.id)
+            active_session = await get_chat_session(db, user.id, chat_session.id)
+            sessions = await list_chat_sessions(db, user.id)
+            pg_messages = await get_session_messages(db, chat_session.id)
+            await db.refresh(chat_session)
+
+            assert deleted is True
+            assert chat_session.is_active is False
+            assert active_session is None
+            assert sessions == []
+            assert [message.content for message in pg_messages] == ["hello"]
+            assert not await redis_cache.exists(redis_key)
+            assert (
+                await delete_chat_session(db, redis_cache, user.id, chat_session.id)
+                is False
+            )
 
     asyncio.run(run_check())
 

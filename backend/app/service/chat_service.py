@@ -23,6 +23,7 @@ from app.service.search_service import format_web_references_for_prompt, search_
 from app.service.session_service import (
     add_message,
     create_chat_session,
+    delete_chat_session,
     get_chat_session,
     get_formatted_history_messages,
     get_session_messages,
@@ -122,6 +123,15 @@ async def list_user_chat_sessions(
     user_id: UUID,
 ) -> list[ChatSession]:
     return await list_chat_sessions(db, user_id)
+
+
+async def delete_user_chat_session(
+    db: AsyncSession,
+    redis_cache: RedisCache,
+    user_id: UUID,
+    session_id: UUID,
+) -> bool:
+    return await delete_chat_session(db, redis_cache, user_id, session_id)
 
 
 async def get_user_chat_messages(

@@ -18,6 +18,7 @@ from app.schemas.chat import (
 )
 from app.service.chat_service import (
     create_user_chat_session,
+    delete_user_chat_session,
     get_user_chat_messages,
     get_user_chat_session,
     list_user_chat_sessions,
@@ -51,6 +52,26 @@ async def read_sessions(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> list[ChatSessionResponse]:
     return await list_user_chat_sessions(db, current_user.id)
+
+
+@router.delete("/session/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_session(
+    session_id: UUID,
+    current_user: Annotated[User, Depends(get_current_user_required)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    redis_cache: Annotated[RedisCache, Depends(get_redis_cache)],
+) -> None:
+    deleted = await delete_user_chat_session(
+        db,
+        redis_cache,
+        current_user.id,
+        session_id,
+    )
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chat session not found.",
+        )
 
 
 @router.get("/session/{session_id}/messages", response_model=list[ChatMessageResponse])

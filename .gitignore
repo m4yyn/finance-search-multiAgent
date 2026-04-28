@@ -46,6 +46,11 @@ tmp/
 temp/
 
 # Build artifacts
+node_modules/
+frontend/node_modules/
+frontend/.vite/
+frontend/test-results/
+frontend/playwright-report/
 dist/
 build/
 *.egg-info/

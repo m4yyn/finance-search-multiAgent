@@ -125,6 +125,24 @@ async def list_chat_sessions(
     return list(result.scalars().all())
 
 
+async def delete_chat_session(
+    db: AsyncSession,
+    redis_cache: RedisCache,
+    user_id: UUID,
+    session_id: UUID,
+) -> bool:
+    """Soft-delete a user-owned chat session and clear its short-term memory."""
+    chat_session = await get_chat_session(db, user_id, session_id)
+    if chat_session is None:
+        return False
+
+    chat_session.is_active = False
+    chat_session.updated_at = utc_now()
+    await db.commit()
+    await redis_cache.delete(get_chat_redis_key(session_id))
+    return True
+
+
 async def add_message(
     db: AsyncSession,
     redis_cache: RedisCache,
