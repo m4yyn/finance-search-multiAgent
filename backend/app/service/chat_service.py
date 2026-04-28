@@ -8,6 +8,7 @@ from app.core.redis_client import RedisCache
 from app.models import ChatMessage, ChatSession
 from app.schemas.chat import ChatReference, ChatSSEChunk
 from app.schemas.knowledge import RetrivalChunk
+from app.schemas.search import WebSearchResult
 from app.service import llm_service
 from app.service.local_file_router_service import (
     list_local_document_candidates,
@@ -18,6 +19,7 @@ from app.service.retrieval_service import (
     retrieve_from_documents,
     retrieve_from_kbs,
 )
+from app.service.search_service import format_web_references_for_prompt, search_web
 from app.service.session_service import (
     add_message,
     create_chat_session,
@@ -37,6 +39,22 @@ RAG_PROMPT_TEMPLATE = """你是金融行业信息助手。请严格基于以下�
 4. 如果不同参考资料冲突，请指出冲突并说明你采用的依据。
 
 参考资料：
+{formatted_refs}
+
+用户问题：
+{question}
+"""
+
+WEB_SEARCH_PROMPT_TEMPLATE = """你是金融行业信息助手。请基于以下联网搜索资料回答用户问题。
+
+要求：
+1. 回答必须使用中文，结论先行，必要时给出简短背景。
+2. 凡引用联网搜索资料中的事实、观点或数字，必须用 [编号] 标注来源。
+3. 如果联网搜索资料不足以回答，请明确说明“联网搜索未提供足够依据”，不要编造事实或数据。
+4. 如果资料之间存在时间或口径差异，请说明差异并优先使用更新、更权威的来源。
+5. 不要声称读取了用户本地文件；本回答只基于联网搜索资料。
+
+联网搜索资料：
 {formatted_refs}
 
 用户问题：
@@ -140,6 +158,25 @@ def build_chat_references(chunks: list[RetrivalChunk]) -> list[ChatReference]:
     ]
 
 
+def build_web_search_references(results: list[WebSearchResult]) -> list[ChatReference]:
+    """Convert web search results into the shared frontend reference shape."""
+    return [
+        ChatReference(
+            index=result.index,
+            content=result.summary or result.snippet,
+            filename=result.title,
+            source_type="web",
+            score=0.0,
+            url=result.url,
+            site_name=result.site_name,
+            site_icon=result.site_icon,
+            date_published=result.date_published,
+            display_url=result.display_url,
+        )
+        for result in results
+    ]
+
+
 def format_references_for_prompt(references: list[ChatReference]) -> str:
     """Format retrieved chunks so model citations match returned reference indexes."""
     if not references:
@@ -173,6 +210,13 @@ def build_rag_prompt(question: str, references: list[ChatReference]) -> str:
     )
 
 
+def build_web_search_prompt(question: str, results: list[WebSearchResult]) -> str:
+    return WEB_SEARCH_PROMPT_TEMPLATE.format(
+        formatted_refs=format_web_references_for_prompt(results),
+        question=question,
+    )
+
+
 async def stream_chat_response(
     sessionmaker: async_sessionmaker[AsyncSession],
     redis_cache: RedisCache,
@@ -182,17 +226,6 @@ async def stream_chat_response(
     search_mode: str = "none",
 ) -> AsyncGenerator[str, None]:
     """Persist a user message, stream the LLM reply, then persist assistant output."""
-    if search_mode == "web":
-        yield format_sse_chunk(
-            ChatSSEChunk(
-                type="error",
-                session_id=session_id,
-                done=True,
-                error="网络搜索尚未接入",
-            )
-        )
-        return
-
     async with sessionmaker() as db:
         await add_message(db, redis_cache, session_id, "user", user_content)
         history_messages = await get_formatted_history_messages(
@@ -200,45 +233,53 @@ async def stream_chat_response(
             redis_cache,
             session_id,
         )
-        references: list[ChatReference] = []
-        llm_messages = build_ordinary_chat_messages(history_messages)
-        if search_mode == "local":
-            candidates = await list_local_document_candidates(db, user_id)
-            route = await route_query_to_local_files(user_content, candidates)
-            if route.route == "documents":
-                retrieved_chunks = await retrieve_from_documents(
-                    db,
-                    user_id,
-                    route.document_ids,
-                    user_content,
-                    top_k=5,
-                )
-            elif route.route == "knowledge_bases":
-                retrieved_chunks = await retrieve_from_kbs(
-                    db,
-                    user_id,
-                    route.kb_ids,
-                    user_content,
-                    top_k=5,
-                )
-            elif route.route == "all":
-                retrieved_chunks = await retrieve_from_all_user_kbs(
-                    db,
-                    user_id,
-                    user_content,
-                    top_k=5,
-                )
-            else:
-                retrieved_chunks = []
-            references = build_chat_references(retrieved_chunks)
-            rag_prompt = build_rag_prompt(user_content, references)
-            llm_messages = [
-                *history_messages[:-1],
-                {"role": "user", "content": rag_prompt},
-            ]
-
         assistant_content_parts: list[str] = []
         try:
+            references: list[ChatReference] = []
+            llm_messages = build_ordinary_chat_messages(history_messages)
+            if search_mode == "local":
+                candidates = await list_local_document_candidates(db, user_id)
+                route = await route_query_to_local_files(user_content, candidates)
+                if route.route == "documents":
+                    retrieved_chunks = await retrieve_from_documents(
+                        db,
+                        user_id,
+                        route.document_ids,
+                        user_content,
+                        top_k=5,
+                    )
+                elif route.route == "knowledge_bases":
+                    retrieved_chunks = await retrieve_from_kbs(
+                        db,
+                        user_id,
+                        route.kb_ids,
+                        user_content,
+                        top_k=5,
+                    )
+                elif route.route == "all":
+                    retrieved_chunks = await retrieve_from_all_user_kbs(
+                        db,
+                        user_id,
+                        user_content,
+                        top_k=5,
+                    )
+                else:
+                    retrieved_chunks = []
+                references = build_chat_references(retrieved_chunks)
+                rag_prompt = build_rag_prompt(user_content, references)
+                llm_messages = [
+                    *history_messages[:-1],
+                    {"role": "user", "content": rag_prompt},
+                ]
+            elif search_mode == "web":
+                web_response = await search_web(redis_cache, user_content, count=5)
+                references = build_web_search_references(web_response.results)
+                web_prompt = build_web_search_prompt(user_content, web_response.results)
+                llm_messages = [
+                    *history_messages[:-1],
+                    {"role": "user", "content": web_prompt},
+                ]
+
             async for delta in llm_service.stream_chat_completion(llm_messages):
                 assistant_content_parts.append(delta)
                 yield format_sse_chunk(

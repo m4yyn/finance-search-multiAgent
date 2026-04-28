@@ -11,6 +11,7 @@ from app.core.database import Base
 from app.core.redis_client import RedisCache
 from app.models import ChatMessage, User
 from app.schemas.knowledge import RetrivalChunk
+from app.schemas.search import WebSearchResponse, WebSearchResult
 from app.service import chat_service, session_service
 from app.service.local_file_router_service import LocalFileRoute
 from app.service.chat_service import (
@@ -120,10 +121,14 @@ def test_chat_service_stream_success_persists_user_and_assistant(monkeypatch) ->
             async def fail_retrieve(*args, **kwargs):  # noqa: ANN002, ANN003
                 raise AssertionError("Pure LLM chat must not call retrieval.")
 
+            async def fail_search(*args, **kwargs):  # noqa: ANN002, ANN003
+                raise AssertionError("Pure LLM chat must not call web search.")
+
             monkeypatch.setattr(chat_service.llm_service, "stream_chat_completion", fake_stream)
             monkeypatch.setattr(chat_service, "retrieve_from_documents", fail_retrieve)
             monkeypatch.setattr(chat_service, "retrieve_from_kbs", fail_retrieve)
             monkeypatch.setattr(chat_service, "retrieve_from_all_user_kbs", fail_retrieve)
+            monkeypatch.setattr(chat_service, "search_web", fail_search)
 
             chat_session = await create_user_chat_session(session, user.id)
             chunks = [
@@ -207,6 +212,9 @@ def test_chat_service_stream_with_local_document_route_uses_references_without_s
                     )
                 ]
 
+            async def fail_search(*args, **kwargs):  # noqa: ANN002, ANN003
+                raise AssertionError("Local RAG chat must not call web search.")
+
             async def fake_stream(
                 messages: list[dict[str, str]],
             ) -> AsyncGenerator[str, None]:
@@ -226,6 +234,7 @@ def test_chat_service_stream_with_local_document_route_uses_references_without_s
             monkeypatch.setattr(chat_service, "list_local_document_candidates", fake_candidates)
             monkeypatch.setattr(chat_service, "route_query_to_local_files", fake_route)
             monkeypatch.setattr(chat_service, "retrieve_from_documents", fake_retrieve)
+            monkeypatch.setattr(chat_service, "search_web", fail_search)
             monkeypatch.setattr(chat_service.llm_service, "stream_chat_completion", fake_stream)
 
             chat_session = await create_user_chat_session(session, user.id)
@@ -351,15 +360,58 @@ def test_chat_service_stream_with_local_all_route_uses_all_user_kbs(
     asyncio.run(run_check())
 
 
-def test_chat_service_web_mode_returns_error_without_persisting(monkeypatch) -> None:
+def test_chat_service_web_mode_uses_search_references_and_persists_history(
+    monkeypatch,
+) -> None:
     async def run_check() -> None:
         session, sessionmaker, redis_cache, user = await build_context()
         try:
-            async def fail_stream(*args, **kwargs):  # noqa: ANN002, ANN003
-                raise AssertionError("Web placeholder must not call LLM stream.")
-                yield "unreachable"
+            monkeypatch.setattr(session_service, "count_message_tokens", lambda _: 1)
 
-            monkeypatch.setattr(chat_service.llm_service, "stream_chat_completion", fail_stream)
+            async def fake_search(redis_cache_arg, query, count=5, **kwargs):  # noqa: ANN001, ANN003
+                assert redis_cache_arg is redis_cache
+                assert query == "查一下2026年4月A股市场"
+                assert count == 5
+                return WebSearchResponse(
+                    query=query,
+                    count=count,
+                    freshness="noLimit",
+                    summary=True,
+                    results=[
+                        WebSearchResult(
+                            index=1,
+                            title="2026年4月A股市场综述",
+                            url="https://example.com/a-share",
+                            snippet="A股市场新闻摘要",
+                            summary="2026年4月A股市场表现活跃。",
+                            site_name="Example Finance",
+                            date_published="2026-04-28",
+                        )
+                    ],
+                )
+
+            async def fake_stream(
+                messages: list[dict[str, str]],
+            ) -> AsyncGenerator[str, None]:
+                prompt = messages[-1]["content"]
+                assert all(
+                    message["content"] != chat_service.ORDINARY_CHAT_SYSTEM_PROMPT
+                    for message in messages
+                )
+                assert "请基于以下联网搜索资料回答用户问题" in prompt
+                assert "[1] 2026年4月A股市场综述" in prompt
+                assert "2026年4月A股市场表现活跃。" in prompt
+                yield "A股市场"
+                yield "表现活跃[1]"
+
+            async def fail_retrieve(*args, **kwargs):  # noqa: ANN002, ANN003
+                raise AssertionError("Web search chat must not call local retrieval.")
+
+            monkeypatch.setattr(chat_service, "search_web", fake_search)
+            monkeypatch.setattr(chat_service, "retrieve_from_documents", fail_retrieve)
+            monkeypatch.setattr(chat_service, "retrieve_from_kbs", fail_retrieve)
+            monkeypatch.setattr(chat_service, "retrieve_from_all_user_kbs", fail_retrieve)
+            monkeypatch.setattr(chat_service.llm_service, "stream_chat_completion", fake_stream)
 
             chat_session = await create_user_chat_session(session, user.id)
             chunks = [
@@ -369,7 +421,7 @@ def test_chat_service_web_mode_returns_error_without_persisting(monkeypatch) -> 
                     redis_cache,
                     chat_session.id,
                     user.id,
-                    "查一下最新新闻",
+                    "查一下2026年4月A股市场",
                     search_mode="web",
                 )
             ]
@@ -377,20 +429,26 @@ def test_chat_service_web_mode_returns_error_without_persisting(monkeypatch) -> 
             messages = list(
                 (
                     await session.execute(
-                        select(ChatMessage).where(ChatMessage.session_id == chat_session.id)
+                        select(ChatMessage)
+                        .where(ChatMessage.session_id == chat_session.id)
+                        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
                     )
                 ).scalars()
             )
+            redis_messages = await redis_cache.get_list(
+                session_service.get_chat_redis_key(chat_session.id)
+            )
 
-            assert events == [
-                {
-                    "type": "error",
-                    "session_id": str(chat_session.id),
-                    "done": True,
-                    "error": "网络搜索尚未接入",
-                }
+            assert [event["type"] for event in events] == ["delta", "delta", "done"]
+            assert events[2]["references"][0]["source_type"] == "web"
+            assert events[2]["references"][0]["url"] == "https://example.com/a-share"
+            assert [message.role for message in messages] == ["user", "assistant"]
+            assert messages[0].content == "查一下2026年4月A股市场"
+            assert messages[1].content == "A股市场表现活跃[1]"
+            assert [message["role"] for message in redis_messages] == [
+                "user",
+                "assistant",
             ]
-            assert messages == []
         finally:
             await close_context(session)
 

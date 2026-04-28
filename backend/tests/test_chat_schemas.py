@@ -56,12 +56,21 @@ def test_chat_schemas_validate_expected_fields() -> None:
         chunk_id="chunk-1",
         chunk_index=3,
     )
+    web_reference = ChatReference(
+        index=2,
+        source_type="web",
+        content="A股市场新闻摘要",
+        filename="A股市场新闻",
+        url="https://example.com/a-share",
+        site_name="Example Finance",
+        date_published="2026-04-28",
+    )
     chunk = ChatSSEChunk(
         type="delta",
         session_id=session_id,
         message_id=message_id,
         delta="回答",
-        references=[reference],
+        references=[reference, web_reference],
     )
 
     assert create_payload.title == "投资 研究"
@@ -73,6 +82,8 @@ def test_chat_schemas_validate_expected_fields() -> None:
     assert message_response.role == "assistant"
     assert chunk.done is False
     assert chunk.references[0].filename == "annual.pdf"
+    assert chunk.references[1].source_type == "web"
+    assert chunk.references[1].url == "https://example.com/a-share"
 
 
 def test_send_message_rejects_blank_content() -> None:

@@ -15,6 +15,7 @@ from app.core.security import create_access_token
 from app.main import create_app
 from app.models import ChatMessage, User
 from app.schemas.knowledge import RetrivalChunk
+from app.schemas.search import WebSearchResponse, WebSearchResult
 from app.service import chat_service, llm_service, session_service
 from app.service.local_file_router_service import LocalFileRoute
 
@@ -156,11 +157,16 @@ def chat_client(monkeypatch) -> Generator[
                 message["content"] != chat_service.ORDINARY_CHAT_SYSTEM_PROMPT
                 for message in messages
             )
-            assert "参考资料" in content
-            if "贵州茅台2023年净利润为747亿元" in content:
+            if "联网搜索资料" in content:
+                assert "2026年4月A股市场表现活跃" in content
+                yield "A股"
+                yield "活跃[1]"
+            elif "贵州茅台2023年净利润为747亿元" in content:
+                assert "参考资料" in content
                 yield "净利润"
                 yield "747亿元[1]"
             else:
+                assert "参考资料" in content
                 assert "全局知识库回答依据" in content
                 yield "全局"
                 yield "回答[1]"
@@ -373,9 +379,35 @@ def test_chat_router_local_all_route_without_frontend_filters(
     assert events[2]["references"][0]["filename"] == "global.pdf"
 
 
-def test_chat_router_web_mode_returns_placeholder_error(chat_client) -> None:
-    client, _, _, owner_token, _ = chat_client
+def test_chat_router_web_mode_streams_with_search_references(
+    chat_client,
+    monkeypatch,
+) -> None:
+    client, redis_cache, sessionmaker, owner_token, _ = chat_client
     headers = {"Authorization": f"Bearer {owner_token}"}
+
+    async def fake_search(redis_cache_arg, query, count=5, **kwargs):  # noqa: ANN001, ANN003
+        assert redis_cache_arg is redis_cache
+        assert query == "搜索2026年4月A股市场"
+        assert count == 5
+        return WebSearchResponse(
+            query=query,
+            count=count,
+            freshness="noLimit",
+            summary=True,
+            results=[
+                WebSearchResult(
+                    index=1,
+                    title="2026年4月A股市场综述",
+                    url="https://example.com/a-share",
+                    snippet="A股新闻摘要",
+                    summary="2026年4月A股市场表现活跃。",
+                    site_name="Example Finance",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(chat_service, "search_web", fake_search)
 
     create_response = client.post("/api/v1/chat/session", json={}, headers=headers)
     session_id = create_response.json()["session_id"]
@@ -383,7 +415,7 @@ def test_chat_router_web_mode_returns_placeholder_error(chat_client) -> None:
         "/api/v1/chat/stream",
         json={
             "session_id": session_id,
-            "content": "搜索最新新闻",
+            "content": "搜索2026年4月A股市场",
             "search_mode": "web",
         },
         headers=headers,
@@ -391,14 +423,26 @@ def test_chat_router_web_mode_returns_placeholder_error(chat_client) -> None:
     events = parse_sse_events(stream_response.text)
 
     assert stream_response.status_code == 200
-    assert events == [
-        {
-            "type": "error",
-            "session_id": session_id,
-            "done": True,
-            "error": "网络搜索尚未接入",
-        }
-    ]
+    assert [event["type"] for event in events] == ["delta", "delta", "done"]
+    assert events[2]["references"][0]["source_type"] == "web"
+    assert events[2]["references"][0]["url"] == "https://example.com/a-share"
+
+    async def inspect_messages() -> list[ChatMessage]:
+        async with sessionmaker() as session:
+            return list(
+                (
+                    await session.execute(
+                        select(ChatMessage)
+                        .where(ChatMessage.session_id == UUID(session_id))
+                        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                    )
+                ).scalars()
+            )
+
+    messages = asyncio.run(inspect_messages())
+    assert [message.role for message in messages] == ["user", "assistant"]
+    assert messages[0].content == "搜索2026年4月A股市场"
+    assert messages[1].content == "A股活跃[1]"
 
 
 def test_chat_router_hides_other_users_sessions(chat_client) -> None:

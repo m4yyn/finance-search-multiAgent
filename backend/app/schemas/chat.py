@@ -78,17 +78,23 @@ class ChatReference(BaseModel):
 
     index: int
     content: str
-    filename: str
-    score: float
-    kb_id: UUID
-    document_id: UUID
-    chunk_id: str
+    filename: str = ""
+    score: float = 0.0
+    source_type: Literal["local", "web"] = "local"
+    kb_id: UUID | None = None
+    document_id: UUID | None = None
+    chunk_id: str | None = None
     chunk_index: int | None = None
     page_number: int | None = None
     row_number: int | None = None
     sheet_name: str | None = None
     row_start: int | None = None
     row_end: int | None = None
+    url: str | None = None
+    site_name: str | None = None
+    site_icon: str | None = None
+    date_published: str | None = None
+    display_url: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

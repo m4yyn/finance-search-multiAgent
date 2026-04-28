@@ -68,7 +68,7 @@ app/config/settings.py
 - `app/models/chat.py` 定义聊天会话与消息表；PG 保存完整历史，Redis 只保存短期上下文窗口。
 - `app/models/knowledge.py` 定义知识库与上传文档元数据表；PG 存储知识库、文件路径、文件状态和 chunk 数量，Milvus 存储后续 chunk 向量和 chunk metadata。
 - `app/service/session_service.py` 负责聊天会话、消息持久化、Redis 短期记忆裁剪与 OpenAI messages 格式化。
-- `app/service/chat_service.py` 负责聊天的完整流式编排，串联 ORM、Redis、LLM 与结构化 SSE 输出；`/chat/stream` 使用 `search_mode` 三态：`none` 纯 LLM，`local` 本地 RAG，`web` 预留网络搜索。纯 LLM 普通聊天必须注入 `ORDINARY_CHAT_SYSTEM_PROMPT`，限制其只服务金融研究、资料检索、报告写作和系统使用引导。
+- `app/service/chat_service.py` 负责聊天的完整流式编排，串联 ORM、Redis、LLM 与结构化 SSE 输出；`/chat/stream` 使用 `search_mode` 三态：`none` 纯 LLM，`local` 本地 RAG，`web` Bocha 联网搜索。纯 LLM 普通聊天必须注入 `ORDINARY_CHAT_SYSTEM_PROMPT`，限制其只服务金融研究、资料检索、报告写作和系统使用引导。
 - `app/service/local_file_router_service.py` 负责本地搜索的文件意图识别：读取当前用户已成功入库的非敏感文件元数据，让 LLM 严格输出可校验 JSON，再路由到具体文件、知识库或全库检索。
 - `app/service/llm_service.py` 是临时 OpenAI streaming 封装，后续可被 Agent/Deep Research 编排替换。
 - `app/service/embedding_service.py` 封装 OpenAI embedding 调用，后续知识库 chunk 向量化和 Milvus 入库必须复用该入口。
@@ -78,10 +78,12 @@ app/config/settings.py
 - `app/service/document_service.py` 负责文档入库流水线，串联 PG `Document` 状态、解析、chunk、embedding 和 Milvus 写入。
 - `app/service/retrieval_service.py` 负责知识库 dense vector 召回，支持单 KB 和多 KB 合并排序。
 - 聊天 RAG 的引用对象由 `app/schemas/chat.py` 的 `ChatReference` 表达，并随最终 `done` SSE 事件返回给前端；增强 prompt 只传给 LLM，不写入 PG/Redis 历史。
+- `app/service/search_service.py` 负责 Bocha 联网搜索和 Redis 短缓存；缓存 key 必须使用 `web_search:bocha:` 前缀，避免与本地 RAG、聊天 session 短期记忆混用。
 - `app/router/knowledge_router.py` 是知识库创建、列表、删除和测试召回接口入口。
 - `GET /api/v1/knowledge/bases/{kb_id}/stats` 用于验收和诊断 PG chunk_count 与 Milvus row_count 是否一致。
 - `app/router/document_router.py` 是知识库文档上传、列表和删除接口入口，上传后用后台任务触发入库。
 - `app/router/chat_router.py` 是聊天接口入口，发送消息接口使用结构化 JSON SSE。
+- `app/router/search_router.py` 是联网搜索测试接口入口，当前提供 `POST /api/v1/search/web`。
 
 ## 模块索引
 
@@ -138,6 +140,7 @@ POST /api/v1/knowledge/bases/{kb_id}/documents
 GET /api/v1/knowledge/bases/{kb_id}/documents
 DELETE /api/v1/knowledge/bases/{kb_id}/documents/{doc_id}
 POST /api/v1/knowledge/retrieve
+POST /api/v1/search/web
 ```
 
 数据库迁移：
@@ -217,7 +220,8 @@ cd backend
   - RAG 由 `search_mode="local"` 触发；纯聊天路径 `search_mode="none"` 不得调用 embedding、Milvus 或 retrieval，并且必须把 `ORDINARY_CHAT_SYSTEM_PROMPT` 作为发给 LLM 的第一条 system message
   - `ORDINARY_CHAT_SYSTEM_PROMPT` 只用于普通聊天；不得写入 PG/Redis，不得叠加到本地 RAG、网络搜索或未来 Deep Research 流程
   - 上传仍按 KnowledgeBase 分类；问答端不暴露高级筛选，具体文件/知识库选择由 `local_file_router_service.py` 自动识别
-  - `search_mode="web"` 当前只返回“网络搜索尚未接入”，Phase 4 再接 Bocha
+  - `search_mode="web"` 应调用 `search_service.py` 的 Bocha 搜索，使用 `WEB_SEARCH_PROMPT_TEMPLATE`，最终 `done.references` 返回 `source_type="web"` 的引用
+  - Bocha 搜索缓存必须独立使用 `web_search:bocha:` key，不得写入 `chat:session:*:messages`
   - RAG 增强 prompt 不得写入 PG/Redis，PG/Redis 只保存用户原始问题和 assistant 回答
   - `ChatSSEChunk.references` 只在最终 `done` 事件中返回，编号必须与 prompt 中 `[编号]` 一致
   - 模型字段变化必须新增 Alembic migration
