@@ -92,7 +92,9 @@ async def stream_message(
             sessionmaker,
             redis_cache,
             payload.session_id,
+            current_user.id,
             payload.content,
+            payload.kb_ids,
         ),
         media_type="text/event-stream",
         headers={

@@ -58,15 +58,23 @@ async def db_check_tables_and_version() -> None:
             version = await connection.scalar(text("select version_num from alembic_version"))
             chat_sessions = await connection.scalar(text("select to_regclass('public.chat_sessions')"))
             chat_messages = await connection.scalar(text("select to_regclass('public.chat_messages')"))
+            knowledge_bases = await connection.scalar(
+                text("select to_regclass('public.knowledge_bases')")
+            )
+            documents = await connection.scalar(text("select to_regclass('public.documents')"))
     finally:
         await engine.dispose()
 
     print(f"Alembic current: {version}")
     print(f"PG table chat_sessions: {chat_sessions}")
     print(f"PG table chat_messages: {chat_messages}")
-    assert version == "202604270002"
+    print(f"PG table knowledge_bases: {knowledge_bases}")
+    print(f"PG table documents: {documents}")
+    assert version == "202604280003"
     assert chat_sessions == "chat_sessions"
     assert chat_messages == "chat_messages"
+    assert knowledge_bases == "knowledge_bases"
+    assert documents == "documents"
 
 
 async def redis_fetch_messages(session_id: str) -> list[dict]:

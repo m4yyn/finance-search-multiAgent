@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections.abc import AsyncGenerator
+from uuid import uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -9,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 from app.core.database import Base
 from app.core.redis_client import RedisCache
 from app.models import ChatMessage, User
+from app.schemas.knowledge import RetrivalChunk
 from app.service import chat_service, session_service
 from app.service.chat_service import (
     create_user_chat_session,
@@ -107,7 +109,11 @@ def test_chat_service_stream_success_persists_user_and_assistant(monkeypatch) ->
                 yield "你"
                 yield "好"
 
+            async def fail_retrieve(*args, **kwargs):  # noqa: ANN002, ANN003
+                raise AssertionError("Pure LLM chat must not call retrieval.")
+
             monkeypatch.setattr(chat_service.llm_service, "stream_chat_completion", fake_stream)
+            monkeypatch.setattr(chat_service, "retrieve_from_kbs", fail_retrieve)
 
             chat_session = await create_user_chat_session(session, user.id)
             chunks = [
@@ -116,6 +122,7 @@ def test_chat_service_stream_success_persists_user_and_assistant(monkeypatch) ->
                     sessionmaker,
                     redis_cache,
                     chat_session.id,
+                    user.id,
                     "hello",
                 )
             ]
@@ -149,6 +156,92 @@ def test_chat_service_stream_success_persists_user_and_assistant(monkeypatch) ->
     asyncio.run(run_check())
 
 
+def test_chat_service_stream_with_rag_uses_references_without_storing_prompt(
+    monkeypatch,
+) -> None:
+    async def run_check() -> None:
+        session, sessionmaker, redis_cache, user = await build_context()
+        kb_id = uuid4()
+        document_id = uuid4()
+        try:
+            monkeypatch.setattr(session_service, "count_message_tokens", lambda _: 1)
+
+            async def fake_retrieve(db, user_id, kb_ids, query, top_k=5):  # noqa: ANN001
+                assert user_id == user.id
+                assert kb_ids == [kb_id]
+                assert query == "公司净利润是多少"
+                assert top_k == 5
+                return [
+                    RetrivalChunk(
+                        kb_id=kb_id,
+                        document_id=document_id,
+                        filename="annual.pdf",
+                        content="公司2023年净利润为100亿元。",
+                        score=0.93,
+                        chunk_id="chunk-1",
+                        chunk_index=7,
+                    )
+                ]
+
+            async def fake_stream(
+                messages: list[dict[str, str]],
+            ) -> AsyncGenerator[str, None]:
+                prompt = messages[-1]["content"]
+                assert messages[-1]["role"] == "user"
+                assert "请严格基于以下参考资料回答用户问题" in prompt
+                assert "[1] annual.pdf | score=0.9300 | chunk=7" in prompt
+                assert "公司2023年净利润为100亿元。" in prompt
+                assert "用户问题：\n公司净利润是多少" in prompt
+                yield "净利润为"
+                yield "100亿元[1]"
+
+            monkeypatch.setattr(chat_service, "retrieve_from_kbs", fake_retrieve)
+            monkeypatch.setattr(chat_service.llm_service, "stream_chat_completion", fake_stream)
+
+            chat_session = await create_user_chat_session(session, user.id)
+            chunks = [
+                chunk
+                async for chunk in stream_chat_response(
+                    sessionmaker,
+                    redis_cache,
+                    chat_session.id,
+                    user.id,
+                    "公司净利润是多少",
+                    [kb_id],
+                )
+            ]
+            events = parse_sse_events(chunks)
+            messages = list(
+                (
+                    await session.execute(
+                        select(ChatMessage)
+                        .where(ChatMessage.session_id == chat_session.id)
+                        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                    )
+                ).scalars()
+            )
+            redis_messages = await redis_cache.get_list(
+                session_service.get_chat_redis_key(chat_session.id)
+            )
+
+            assert [event["type"] for event in events] == ["delta", "delta", "done"]
+            assert events[2]["references"][0]["index"] == 1
+            assert events[2]["references"][0]["filename"] == "annual.pdf"
+            assert events[2]["references"][0]["content"] == "公司2023年净利润为100亿元。"
+            assert [message.role for message in messages] == ["user", "assistant"]
+            assert messages[0].content == "公司净利润是多少"
+            assert "参考资料" not in messages[0].content
+            assert messages[1].content == "净利润为100亿元[1]"
+            assert [message["content"] for message in redis_messages] == [
+                "公司净利润是多少",
+                "净利润为100亿元[1]",
+            ]
+        finally:
+            await close_context(session)
+
+    asyncio.run(run_check())
+
+
 def test_chat_service_stream_error_keeps_user_without_assistant(monkeypatch) -> None:
     async def run_check() -> None:
         session, sessionmaker, redis_cache, user = await build_context()
@@ -171,6 +264,7 @@ def test_chat_service_stream_error_keeps_user_without_assistant(monkeypatch) -> 
                     sessionmaker,
                     redis_cache,
                     chat_session.id,
+                    user.id,
                     "hello",
                 )
             ]

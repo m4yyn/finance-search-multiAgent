@@ -1,7 +1,7 @@
 import asyncio
 import json
 from collections.abc import AsyncGenerator, Generator
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,7 +14,8 @@ from app.core.redis_client import get_redis_cache
 from app.core.security import create_access_token
 from app.main import create_app
 from app.models import ChatMessage, User
-from app.service import llm_service, session_service
+from app.schemas.knowledge import RetrivalChunk
+from app.service import chat_service, llm_service, session_service
 
 
 class FakeRedis:
@@ -138,9 +139,15 @@ def chat_client(monkeypatch) -> Generator[
 
     async def fake_stream(messages: list[dict[str, str]]) -> AsyncGenerator[str, None]:
         assert messages[-1]["role"] == "user"
-        assert messages[-1]["content"] == "请分析银行股"
-        yield "银行"
-        yield "分析"
+        content = messages[-1]["content"]
+        if content == "请分析银行股":
+            yield "银行"
+            yield "分析"
+        else:
+            assert "参考资料" in content
+            assert "贵州茅台2023年净利润为747亿元" in content
+            yield "净利润"
+            yield "747亿元[1]"
 
     monkeypatch.setattr(llm_service, "stream_chat_completion", fake_stream)
     monkeypatch.setattr(session_service, "count_message_tokens", lambda _: 1)
@@ -239,6 +246,52 @@ def test_chat_router_creates_reads_and_streams_messages(chat_client) -> None:
         "user",
         "assistant",
     ]
+
+
+def test_chat_router_streams_with_kb_ids_and_returns_references(
+    chat_client,
+    monkeypatch,
+) -> None:
+    client, _, _, owner_token, _ = chat_client
+    headers = {"Authorization": f"Bearer {owner_token}"}
+    kb_id = uuid4()
+    document_id = uuid4()
+
+    async def fake_retrieve(db, user_id, kb_ids, query, top_k=5):  # noqa: ANN001
+        assert kb_ids == [kb_id]
+        assert query == "贵州茅台2023年净利润是多少"
+        return [
+            RetrivalChunk(
+                kb_id=kb_id,
+                document_id=document_id,
+                filename="maotai.pdf",
+                content="贵州茅台2023年净利润为747亿元。",
+                score=0.91,
+                chunk_id="chunk-1",
+                chunk_index=1,
+            )
+        ]
+
+    monkeypatch.setattr(chat_service, "retrieve_from_kbs", fake_retrieve)
+
+    create_response = client.post("/api/v1/chat/session", json={}, headers=headers)
+    session_id = create_response.json()["session_id"]
+    stream_response = client.post(
+        "/api/v1/chat/stream",
+        json={
+            "session_id": session_id,
+            "content": "贵州茅台2023年净利润是多少",
+            "kb_ids": [str(kb_id)],
+        },
+        headers=headers,
+    )
+    events = parse_sse_events(stream_response.text)
+
+    assert stream_response.status_code == 200
+    assert [event["type"] for event in events] == ["delta", "delta", "done"]
+    assert events[2]["references"][0]["index"] == 1
+    assert events[2]["references"][0]["filename"] == "maotai.pdf"
+    assert events[2]["references"][0]["score"] == 0.91
 
 
 def test_chat_router_hides_other_users_sessions(chat_client) -> None:

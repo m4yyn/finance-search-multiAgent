@@ -162,7 +162,7 @@ def test_task_5_alembic_current_and_pg_users_table_exist() -> None:
     output = f"{result.stdout}\n{result.stderr}"
 
     assert result.returncode == 0
-    assert "202604270002" in output
+    assert "202604280003" in output
     assert run_async(db_scalar("select to_regclass('public.users')")) == "users"
     assert (
         run_async(db_scalar("select to_regclass('public.chat_sessions')"))
@@ -172,6 +172,11 @@ def test_task_5_alembic_current_and_pg_users_table_exist() -> None:
         run_async(db_scalar("select to_regclass('public.chat_messages')"))
         == "chat_messages"
     )
+    assert (
+        run_async(db_scalar("select to_regclass('public.knowledge_bases')"))
+        == "knowledge_bases"
+    )
+    assert run_async(db_scalar("select to_regclass('public.documents')")) == "documents"
 
 
 def test_task_6_four_user_schemas_validate() -> None:

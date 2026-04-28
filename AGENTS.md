@@ -2,7 +2,7 @@
 
 ## 项目目标
 
-本项目从零构建“金融行业信息报告编写 Agent 助手”。当前后端已具备 FastAPI 骨架、配置读取、PostgreSQL ORM、Redis 工具、JWT 鉴权、用户注册登录、聊天会话、流式 LLM 回复与 Alembic 迁移基础。后续实现 Agent、RAG、报告生成或数据处理逻辑时，必须沿用现有分层关系，不得绕过 service/router/schema/core 边界。
+本项目从零构建“金融行业信息报告编写 Agent 助手”。当前后端已具备 FastAPI 骨架、配置读取、PostgreSQL ORM、Redis 工具、JWT 鉴权、用户注册登录、聊天会话、流式 LLM 回复、知识库元数据与 Alembic 迁移基础。后续实现 Agent、RAG、报告生成或数据处理逻辑时，必须沿用现有分层关系，不得绕过 service/router/schema/core 边界。
 
 ## 目录约束
 
@@ -66,9 +66,20 @@ app/config/settings.py
 - `app/schemas/user.py` 是用户注册、登录、用户响应和 token 响应的标准 API 契约入口；`app/schemas/auth.py` 仅保留兼容重导出。
 - `app/router/auth_router.py` 是认证接口的标准路由入口；`app/router/auth.py` 仅保留兼容重导出。
 - `app/models/chat.py` 定义聊天会话与消息表；PG 保存完整历史，Redis 只保存短期上下文窗口。
+- `app/models/knowledge.py` 定义知识库与上传文档元数据表；PG 存储知识库、文件路径、文件状态和 chunk 数量，Milvus 存储后续 chunk 向量和 chunk metadata。
 - `app/service/session_service.py` 负责聊天会话、消息持久化、Redis 短期记忆裁剪与 OpenAI messages 格式化。
-- `app/service/chat_service.py` 负责普通聊天的完整流式编排，串联 ORM、Redis、LLM 与结构化 SSE 输出。
+- `app/service/chat_service.py` 负责聊天的完整流式编排，串联 ORM、Redis、LLM 与结构化 SSE 输出；当 `/chat/stream` 请求携带非空 `kb_ids` 时启用本地知识库 RAG，否则保持纯 LLM。
 - `app/service/llm_service.py` 是临时 OpenAI streaming 封装，后续可被 Agent/Deep Research 编排替换。
+- `app/service/embedding_service.py` 封装 OpenAI embedding 调用，后续知识库 chunk 向量化和 Milvus 入库必须复用该入口。
+- `app/service/milvus_service.py` 封装本地 Milvus collection、chunk 插入、dense vector 检索和删除操作；BM25/hybrid 检索后续放 retrieval 编排层。
+- `app/service/docmind_service.py` 封装阿里云 DocMind 异步解析任务，负责提交、轮询和分页聚合 Markdown 结果。
+- `app/service/xlsx_service.py` 负责 Excel 解析和切块，DocMind 失败时对 `.xlsx/.xlsm` 使用 openpyxl 本地回退。
+- `app/service/document_service.py` 负责文档入库流水线，串联 PG `Document` 状态、解析、chunk、embedding 和 Milvus 写入。
+- `app/service/retrieval_service.py` 负责知识库 dense vector 召回，支持单 KB 和多 KB 合并排序。
+- 聊天 RAG 的引用对象由 `app/schemas/chat.py` 的 `ChatReference` 表达，并随最终 `done` SSE 事件返回给前端；增强 prompt 只传给 LLM，不写入 PG/Redis 历史。
+- `app/router/knowledge_router.py` 是知识库创建、列表、删除和测试召回接口入口。
+- `GET /api/v1/knowledge/bases/{kb_id}/stats` 用于验收和诊断 PG chunk_count 与 Milvus row_count 是否一致。
+- `app/router/document_router.py` 是知识库文档上传、列表和删除接口入口，上传后用后台任务触发入库。
 - `app/router/chat_router.py` 是聊天接口入口，发送消息接口使用结构化 JSON SSE。
 
 ## 模块索引
@@ -90,6 +101,8 @@ app/config/settings.py
 - 改认证接口或用户 API：先读 `backend/app/schemas/user.py` -> `backend/app/core/security.py` -> `backend/app/core/redis_client.py` -> `backend/app/service/auth_service.py` -> `backend/app/router/auth_router.py` -> `backend/tests/test_auth.py`。
 - 改用户表或数据库字段：先读 `backend/app/core/database.py` -> `backend/app/models/user.py` -> `backend/app/models/__init__.py` -> `backend/alembic/env.py` -> `backend/alembic/versions/*` -> `backend/tests/test_user_model.py` -> `backend/tests/test_alembic_config.py`。
 - 改聊天会话、消息或流式回复：先读 `backend/app/models/chat.py` -> `backend/app/schemas/chat.py` -> `backend/app/service/session_service.py` -> `backend/app/service/chat_service.py` -> `backend/app/service/llm_service.py` -> `backend/app/router/chat_router.py` -> `backend/tests/test_chat_service.py` -> `backend/tests/test_chat_router.py`。
+- 改聊天 RAG：先读 `backend/app/schemas/chat.py` -> `backend/app/schemas/knowledge.py` -> `backend/app/service/retrieval_service.py` -> `backend/app/service/chat_service.py` -> `backend/app/router/chat_router.py` -> `backend/tests/test_chat_service.py` -> `backend/tests/test_chat_router.py` -> `backend/scripts/test_phase3_rag.py`。
+- 改知识库、上传文档或检索契约：先读 `backend/app/models/knowledge.py` -> `backend/app/schemas/knowledge.py` -> `backend/app/service/docmind_service.py` -> `backend/app/service/xlsx_service.py` -> `backend/app/service/document_service.py` -> `backend/app/service/embedding_service.py` -> `backend/app/service/milvus_service.py` -> `backend/app/service/retrieval_service.py` -> `backend/app/router/knowledge_router.py` -> `backend/app/router/document_router.py` -> `backend/app/core/milvus.py` -> `backend/alembic/versions/*` -> `backend/tests/test_knowledge_model.py` -> `backend/tests/test_knowledge_schemas.py`。
 - 改配置或环境变量：先读 `backend/.env.example` -> `backend/app/config/settings.py` -> 相关 `backend/app/core/*` 客户端 -> `backend/alembic/env.py` -> 对应测试。
 - 改业务服务：先读对应 `schemas` 和 `models` -> `backend/app/service/*` -> 调用它的 `router` -> 对应测试。
 - 改路由挂载或 API 前缀：先读 `backend/app/router/api.py` -> `backend/app/main.py` -> `backend/app/config/settings.py` -> 接口测试。
@@ -116,6 +129,14 @@ POST /api/v1/chat/session
 GET /api/v1/chat/sessions
 POST /api/v1/chat/stream
 GET /api/v1/chat/session/{session_id}/messages
+POST /api/v1/knowledge/bases
+GET /api/v1/knowledge/bases
+DELETE /api/v1/knowledge/bases/{kb_id}
+GET /api/v1/knowledge/bases/{kb_id}/stats
+POST /api/v1/knowledge/bases/{kb_id}/documents
+GET /api/v1/knowledge/bases/{kb_id}/documents
+DELETE /api/v1/knowledge/bases/{kb_id}/documents/{doc_id}
+POST /api/v1/knowledge/retrieve
 ```
 
 数据库迁移：
@@ -143,12 +164,24 @@ cd backend
 .venv/bin/python -m pytest tests/test_chat_model.py tests/test_chat_schemas.py tests/test_session_service.py tests/test_chat_service.py tests/test_llm_service.py tests/test_chat_router.py -q
 ```
 
+知识库元数据专项测试：
+
+```bash
+cd backend
+.venv/bin/python -m pytest tests/test_knowledge_model.py tests/test_knowledge_schemas.py tests/test_alembic_config.py -q
+.venv/bin/python -m pytest tests/test_embedding_service.py -q
+.venv/bin/python -m pytest tests/test_milvus_service.py -q
+.venv/bin/python -m pytest tests/test_docmind_service.py tests/test_xlsx_service.py tests/test_document_service.py tests/test_document_chunking.py -q
+.venv/bin/python -m pytest tests/test_retrieval_service.py tests/test_knowledge_router.py tests/test_document_router.py -q
+```
+
 端到端脚本：
 
 ```bash
 cd backend
 .venv/bin/python scripts/test_llm.py
 .venv/bin/python scripts/test_chat.py
+.venv/bin/python scripts/test_phase3_rag.py
 ```
 
 ## 编码规范
@@ -179,9 +212,17 @@ cd backend
   - 仅在兼容导出变化时更新 `app/schemas/auth.py` 和 `app/router/auth.py`
   - 更新注册、登录、鉴权、Redis session 与密码哈希测试
 - 修改聊天会话、消息、Redis 短期记忆或 SSE：
-  - 同步检查 `app/models/chat.py`、`app/schemas/chat.py`、`app/service/session_service.py`、`app/service/chat_service.py`、`app/service/llm_service.py`、`app/router/chat_router.py`
+ - 同步检查 `app/models/chat.py`、`app/schemas/chat.py`、`app/service/session_service.py`、`app/service/chat_service.py`、`app/service/llm_service.py`、`app/router/chat_router.py`
+  - RAG 只能由非空 `kb_ids` 显式触发；纯聊天路径不得调用 embedding、Milvus 或 retrieval
+  - RAG 增强 prompt 不得写入 PG/Redis，PG/Redis 只保存用户原始问题和 assistant 回答
+  - `ChatSSEChunk.references` 只在最终 `done` 事件中返回，编号必须与 prompt 中 `[编号]` 一致
   - 模型字段变化必须新增 Alembic migration
   - 更新模型、schema、service、LLM stream 和 chat router 测试
+- 修改知识库、上传文档、文件类型或检索契约：
+  - 同步检查 `app/models/knowledge.py`、`app/schemas/knowledge.py`、`app/service/docmind_service.py`、`app/service/xlsx_service.py`、`app/service/document_service.py`、`app/service/embedding_service.py`、`app/service/milvus_service.py`、`app/service/retrieval_service.py`、`app/router/knowledge_router.py`、`app/router/document_router.py`、`app/core/milvus.py`
+  - 模型字段变化必须新增 Alembic migration
+  - 文件类型支持变化必须检查上传校验、解析服务、Milvus chunk metadata 与 `DocumentResponse`
+  - `Document.file_path` 是后端内部字段，不应直接暴露到公开 API
 - 修改 API schema：
   - 同步检查对应 router 的 request/response_model
   - 同步检查 service 入参与返回值
@@ -218,6 +259,8 @@ cd backend
 - `LLM_MODEL`
 - `EMBEDDING_MODEL`
 - `EMBEDDING_DIM`
+- `DOCMIND_ACCESS_KEY_ID`
+- `DOCMIND_ACCESS_KEY_SECRET`
 - `BOCHA_API_KEY`
 - `JWT_SECRET_KEY`
 - `JWT_ALGORITHM`

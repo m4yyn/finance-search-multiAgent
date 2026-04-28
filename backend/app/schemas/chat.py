@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -57,6 +57,14 @@ class ChatStreamRequest(SendMessageRequest):
     """Stream one user message to an existing chat session."""
 
     session_id: UUID
+    kb_ids: list[UUID] | None = None
+
+    @field_validator("kb_ids")
+    @classmethod
+    def normalize_kb_ids(cls, value: list[UUID] | None) -> list[UUID] | None:
+        if not value:
+            return None
+        return list(dict.fromkeys(value))
 
 
 class ChatMessageResponse(BaseModel):
@@ -72,6 +80,25 @@ class ChatMessageResponse(BaseModel):
     created_at: datetime
 
 
+class ChatReference(BaseModel):
+    """A retrieved knowledge chunk returned to the frontend for citation display."""
+
+    index: int
+    content: str
+    filename: str
+    score: float
+    kb_id: UUID
+    document_id: UUID
+    chunk_id: str
+    chunk_index: int | None = None
+    page_number: int | None = None
+    row_number: int | None = None
+    sheet_name: str | None = None
+    row_start: int | None = None
+    row_end: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class ChatSSEChunk(BaseModel):
     """Structured SSE data payload for streaming chat responses."""
 
@@ -81,3 +108,4 @@ class ChatSSEChunk(BaseModel):
     delta: str | None = None
     done: bool = False
     error: str | None = None
+    references: list[ChatReference] | None = None
