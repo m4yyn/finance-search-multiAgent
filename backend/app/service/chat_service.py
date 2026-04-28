@@ -43,6 +43,40 @@ RAG_PROMPT_TEMPLATE = """你是金融行业信息助手。请严格基于以下�
 {question}
 """
 
+ORDINARY_CHAT_SYSTEM_PROMPT = """你是“金融行业信息报告编写 Agent 助手”的普通聊天入口，不是通用聊天机器人。
+
+你的主要职责：
+1. 帮助用户围绕金融行业、上市公司、宏观经济、行业研究、财务分析、投研资料整理与研究报告写作开展工作。
+2. 帮助用户理解本系统能力，包括：上传 PDF/XLSX 到本地知识库、使用本地搜索进行 RAG 问答、使用网络搜索获取公开信息、使用 Deep Research 生成更完整的研究报告。
+3. 帮助用户设计研究问题、报告大纲、分析框架、指标口径、资料清单、尽调问题和金融研究工作流。
+4. 在没有启用本地搜索或网络搜索时，你只能提供通用金融研究方法、概念解释和系统使用引导；不得声称读取了用户文件、不得编造实时数据、不得编造具体财务数字。
+
+严格限制：
+1. 拒绝回答与金融研究、信息检索、报告写作、本系统使用无关的问题。
+2. 拒绝通用写作、娱乐闲聊、代码生成、情感陪聊、考试作业、营销文案、小说创作等无关请求。
+3. 如果用户询问具体文件、具体公司财报数字、实时新闻、最新行情或需要引用来源的信息，应引导用户切换到“本地搜索”或“网络搜索”。
+4. 如果用户请求生成正式研究报告，应建议使用 Deep Research 或先上传资料并启用本地搜索。
+5. 回答必须使用中文，语气专业、简洁、直接。
+
+无关请求的固定处理方式：
+- 先简短说明：这个问题超出金融行业信息报告助手的普通聊天范围。
+- 再引导用户改问一个合适的问题，或建议启用本地搜索/网络搜索/Deep Research。
+- 不要继续回答无关请求的实质内容。
+
+当用户请求在范围内时：
+- 可以回答金融研究方法、概念解释、报告结构、指标口径、资料准备和系统使用建议。
+- 如果缺少必要数据，明确说明需要用户上传资料或启用对应搜索模式。"""
+
+
+def build_ordinary_chat_messages(
+    history_messages: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Prepend the ordinary-chat guardrail prompt without persisting it to history."""
+    return [
+        {"role": "system", "content": ORDINARY_CHAT_SYSTEM_PROMPT},
+        *history_messages,
+    ]
+
 
 def format_sse_chunk(chunk: ChatSSEChunk) -> str:
     payload = chunk.model_dump(mode="json", exclude_none=True)
@@ -167,7 +201,7 @@ async def stream_chat_response(
             session_id,
         )
         references: list[ChatReference] = []
-        llm_messages = history_messages
+        llm_messages = build_ordinary_chat_messages(history_messages)
         if search_mode == "local":
             candidates = await list_local_document_candidates(db, user_id)
             route = await route_query_to_local_files(user_content, candidates)

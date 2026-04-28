@@ -142,9 +142,20 @@ def chat_client(monkeypatch) -> Generator[
         assert messages[-1]["role"] == "user"
         content = messages[-1]["content"]
         if content == "请分析银行股":
+            assert messages[0] == {
+                "role": "system",
+                "content": chat_service.ORDINARY_CHAT_SYSTEM_PROMPT,
+            }
+            assert "不是通用聊天机器人" in messages[0]["content"]
+            assert "拒绝回答与金融研究" in messages[0]["content"]
+            assert "本地搜索/网络搜索/Deep Research" in messages[0]["content"]
             yield "银行"
             yield "分析"
         else:
+            assert all(
+                message["content"] != chat_service.ORDINARY_CHAT_SYSTEM_PROMPT
+                for message in messages
+            )
             assert "参考资料" in content
             if "贵州茅台2023年净利润为747亿元" in content:
                 yield "净利润"

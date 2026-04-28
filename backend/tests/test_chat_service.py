@@ -106,6 +106,13 @@ def test_chat_service_stream_success_persists_user_and_assistant(monkeypatch) ->
             async def fake_stream(
                 messages: list[dict[str, str]],
             ) -> AsyncGenerator[str, None]:
+                assert messages[0] == {
+                    "role": "system",
+                    "content": chat_service.ORDINARY_CHAT_SYSTEM_PROMPT,
+                }
+                assert "不是通用聊天机器人" in messages[0]["content"]
+                assert "拒绝回答与金融研究" in messages[0]["content"]
+                assert "本地搜索/网络搜索/Deep Research" in messages[0]["content"]
                 assert messages[-1] == {"role": "user", "content": "hello"}
                 yield "你"
                 yield "好"
@@ -149,10 +156,15 @@ def test_chat_service_stream_success_persists_user_and_assistant(monkeypatch) ->
             assert [message.role for message in messages] == ["user", "assistant"]
             assert messages[0].content == "hello"
             assert messages[1].content == "你好"
+            assert all(
+                chat_service.ORDINARY_CHAT_SYSTEM_PROMPT not in message.content
+                for message in messages
+            )
             assert [message["role"] for message in redis_messages] == [
                 "user",
                 "assistant",
             ]
+            assert all(message["role"] != "system" for message in redis_messages)
         finally:
             await close_context(session)
 
@@ -199,6 +211,10 @@ def test_chat_service_stream_with_local_document_route_uses_references_without_s
                 messages: list[dict[str, str]],
             ) -> AsyncGenerator[str, None]:
                 prompt = messages[-1]["content"]
+                assert all(
+                    message["content"] != chat_service.ORDINARY_CHAT_SYSTEM_PROMPT
+                    for message in messages
+                )
                 assert messages[-1]["role"] == "user"
                 assert "请严格基于以下参考资料回答用户问题" in prompt
                 assert "[1] annual.pdf | score=0.9300 | chunk=7" in prompt
@@ -298,6 +314,10 @@ def test_chat_service_stream_with_local_all_route_uses_all_user_kbs(
                 messages: list[dict[str, str]],
             ) -> AsyncGenerator[str, None]:
                 prompt = messages[-1]["content"]
+                assert all(
+                    message["content"] != chat_service.ORDINARY_CHAT_SYSTEM_PROMPT
+                    for message in messages
+                )
                 assert "global.pdf" in prompt
                 assert "全局知识库片段：净利润为200亿元。" in prompt
                 yield "净利润为200亿元[1]"
@@ -386,6 +406,10 @@ def test_chat_service_stream_error_keeps_user_without_assistant(monkeypatch) -> 
             async def fake_stream(
                 messages: list[dict[str, str]],
             ) -> AsyncGenerator[str, None]:
+                assert messages[0] == {
+                    "role": "system",
+                    "content": chat_service.ORDINARY_CHAT_SYSTEM_PROMPT,
+                }
                 assert messages[-1] == {"role": "user", "content": "hello"}
                 raise RuntimeError("upstream failed")
                 yield "unreachable"
