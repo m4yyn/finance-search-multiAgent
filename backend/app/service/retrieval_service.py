@@ -1,9 +1,10 @@
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import KnowledgeBase
+from app.models import Document, KnowledgeBase
 from app.schemas.knowledge import RetrivalChunk
 from app.service.embedding_service import generate_embedding
 from app.service.milvus_service import vector_search
@@ -85,6 +86,17 @@ def _to_chunk(result: dict[str, Any]) -> RetrivalChunk:
     )
 
 
+def _escape_expr_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _document_filter(document_ids: list[UUID]) -> str:
+    values = ", ".join(
+        f'"{_escape_expr_value(str(document_id))}"' for document_id in document_ids
+    )
+    return f"document_id in [{values}]"
+
+
 async def retrieve_from_kb(
     db: AsyncSession,
     user_id: UUID,
@@ -97,13 +109,72 @@ async def retrieve_from_kb(
         return []
 
     query_vector = await generate_embedding(query)
+    return _search_knowledge_base(knowledge_base, query_vector, top_k)
+
+
+def _search_knowledge_base(
+    knowledge_base: KnowledgeBase,
+    query_vector: list[float],
+    top_k: int,
+    document_ids: list[UUID] | None = None,
+) -> list[RetrivalChunk]:
     results = vector_search(
         knowledge_base.collection_name,
         query_vector,
         limit=top_k,
+        filter_expr=_document_filter(document_ids) if document_ids else "",
         output_fields=RETRIEVAL_OUTPUT_FIELDS,
     )
     return [_to_chunk(result) for result in results]
+
+
+async def list_user_knowledge_bases(
+    db: AsyncSession,
+    user_id: UUID,
+) -> list[KnowledgeBase]:
+    result = await db.execute(
+        select(KnowledgeBase)
+        .where(KnowledgeBase.user_id == user_id)
+        .order_by(KnowledgeBase.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def _get_owned_kbs(
+    db: AsyncSession,
+    user_id: UUID,
+    kb_ids: list[UUID],
+) -> list[KnowledgeBase]:
+    unique_kb_ids = list(dict.fromkeys(kb_ids))
+    if not unique_kb_ids:
+        return []
+    result = await db.execute(
+        select(KnowledgeBase).where(
+            KnowledgeBase.user_id == user_id,
+            KnowledgeBase.id.in_(unique_kb_ids),
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def _get_owned_success_documents(
+    db: AsyncSession,
+    user_id: UUID,
+    document_ids: list[UUID],
+) -> list[tuple[Document, KnowledgeBase]]:
+    unique_document_ids = list(dict.fromkeys(document_ids))
+    if not unique_document_ids:
+        return []
+    result = await db.execute(
+        select(Document, KnowledgeBase)
+        .join(KnowledgeBase, Document.kb_id == KnowledgeBase.id)
+        .where(
+            KnowledgeBase.user_id == user_id,
+            Document.status == "success",
+            Document.id.in_(unique_document_ids),
+        )
+    )
+    return list(result.all())
 
 
 async def retrieve_from_kbs(
@@ -113,8 +184,63 @@ async def retrieve_from_kbs(
     query: str,
     top_k: int = 5,
 ) -> list[RetrivalChunk]:
+    knowledge_bases = await _get_owned_kbs(db, user_id, kb_ids)
+    return await retrieve_from_knowledge_bases(knowledge_bases, query, top_k)
+
+
+async def retrieve_from_documents(
+    db: AsyncSession,
+    user_id: UUID,
+    document_ids: list[UUID],
+    query: str,
+    top_k: int = 5,
+) -> list[RetrivalChunk]:
+    owned_documents = await _get_owned_success_documents(db, user_id, document_ids)
+    if not owned_documents:
+        return []
+
+    query_vector = await generate_embedding(query)
+    document_ids_by_kb: dict[UUID, list[UUID]] = {}
+    knowledge_bases_by_id: dict[UUID, KnowledgeBase] = {}
+    for document, knowledge_base in owned_documents:
+        knowledge_bases_by_id[knowledge_base.id] = knowledge_base
+        document_ids_by_kb.setdefault(knowledge_base.id, []).append(document.id)
+
     merged: list[RetrivalChunk] = []
-    for kb_id in kb_ids:
-        merged.extend(await retrieve_from_kb(db, user_id, kb_id, query, top_k))
+    for kb_id, kb_document_ids in document_ids_by_kb.items():
+        merged.extend(
+            _search_knowledge_base(
+                knowledge_bases_by_id[kb_id],
+                query_vector,
+                top_k,
+                kb_document_ids,
+            )
+        )
+    merged.sort(key=lambda chunk: chunk.score, reverse=True)
+    return merged[:top_k]
+
+
+async def retrieve_from_all_user_kbs(
+    db: AsyncSession,
+    user_id: UUID,
+    query: str,
+    top_k: int = 5,
+) -> list[RetrivalChunk]:
+    knowledge_bases = await list_user_knowledge_bases(db, user_id)
+    return await retrieve_from_knowledge_bases(knowledge_bases, query, top_k)
+
+
+async def retrieve_from_knowledge_bases(
+    knowledge_bases: list[KnowledgeBase],
+    query: str,
+    top_k: int = 5,
+) -> list[RetrivalChunk]:
+    if not knowledge_bases:
+        return []
+
+    query_vector = await generate_embedding(query)
+    merged: list[RetrivalChunk] = []
+    for knowledge_base in knowledge_bases:
+        merged.extend(_search_knowledge_base(knowledge_base, query_vector, top_k))
     merged.sort(key=lambda chunk: chunk.score, reverse=True)
     return merged[:top_k]

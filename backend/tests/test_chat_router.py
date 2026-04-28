@@ -16,6 +16,7 @@ from app.main import create_app
 from app.models import ChatMessage, User
 from app.schemas.knowledge import RetrivalChunk
 from app.service import chat_service, llm_service, session_service
+from app.service.local_file_router_service import LocalFileRoute
 
 
 class FakeRedis:
@@ -145,9 +146,13 @@ def chat_client(monkeypatch) -> Generator[
             yield "分析"
         else:
             assert "参考资料" in content
-            assert "贵州茅台2023年净利润为747亿元" in content
-            yield "净利润"
-            yield "747亿元[1]"
+            if "贵州茅台2023年净利润为747亿元" in content:
+                yield "净利润"
+                yield "747亿元[1]"
+            else:
+                assert "全局知识库回答依据" in content
+                yield "全局"
+                yield "回答[1]"
 
     monkeypatch.setattr(llm_service, "stream_chat_completion", fake_stream)
     monkeypatch.setattr(session_service, "count_message_tokens", lambda _: 1)
@@ -248,7 +253,7 @@ def test_chat_router_creates_reads_and_streams_messages(chat_client) -> None:
     ]
 
 
-def test_chat_router_streams_with_kb_ids_and_returns_references(
+def test_chat_router_streams_with_local_document_route_and_returns_references(
     chat_client,
     monkeypatch,
 ) -> None:
@@ -257,8 +262,16 @@ def test_chat_router_streams_with_kb_ids_and_returns_references(
     kb_id = uuid4()
     document_id = uuid4()
 
-    async def fake_retrieve(db, user_id, kb_ids, query, top_k=5):  # noqa: ANN001
-        assert kb_ids == [kb_id]
+    async def fake_candidates(db, user_id):  # noqa: ANN001
+        return ["candidate"]
+
+    async def fake_route(query, candidates):  # noqa: ANN001
+        assert query == "贵州茅台2023年净利润是多少"
+        assert candidates == ["candidate"]
+        return LocalFileRoute(route="documents", document_ids=[document_id])
+
+    async def fake_retrieve(db, user_id, document_ids, query, top_k=5):  # noqa: ANN001
+        assert document_ids == [document_id]
         assert query == "贵州茅台2023年净利润是多少"
         return [
             RetrivalChunk(
@@ -272,7 +285,9 @@ def test_chat_router_streams_with_kb_ids_and_returns_references(
             )
         ]
 
-    monkeypatch.setattr(chat_service, "retrieve_from_kbs", fake_retrieve)
+    monkeypatch.setattr(chat_service, "list_local_document_candidates", fake_candidates)
+    monkeypatch.setattr(chat_service, "route_query_to_local_files", fake_route)
+    monkeypatch.setattr(chat_service, "retrieve_from_documents", fake_retrieve)
 
     create_response = client.post("/api/v1/chat/session", json={}, headers=headers)
     session_id = create_response.json()["session_id"]
@@ -281,7 +296,7 @@ def test_chat_router_streams_with_kb_ids_and_returns_references(
         json={
             "session_id": session_id,
             "content": "贵州茅台2023年净利润是多少",
-            "kb_ids": [str(kb_id)],
+            "search_mode": "local",
         },
         headers=headers,
     )
@@ -292,6 +307,87 @@ def test_chat_router_streams_with_kb_ids_and_returns_references(
     assert events[2]["references"][0]["index"] == 1
     assert events[2]["references"][0]["filename"] == "maotai.pdf"
     assert events[2]["references"][0]["score"] == 0.91
+
+
+def test_chat_router_local_all_route_without_frontend_filters(
+    chat_client,
+    monkeypatch,
+) -> None:
+    client, _, _, owner_token, _ = chat_client
+    headers = {"Authorization": f"Bearer {owner_token}"}
+    kb_id = uuid4()
+    document_id = uuid4()
+
+    async def fake_candidates(db, user_id):  # noqa: ANN001
+        return ["candidate"]
+
+    async def fake_route(query, candidates):  # noqa: ANN001
+        assert query == "请做全局本地搜索"
+        assert candidates == ["candidate"]
+        return LocalFileRoute(route="all")
+
+    async def fake_retrieve_all(db, user_id, query, top_k=5):  # noqa: ANN001
+        assert query == "请做全局本地搜索"
+        return [
+            RetrivalChunk(
+                kb_id=kb_id,
+                document_id=document_id,
+                filename="global.pdf",
+                content="全局知识库回答依据",
+                score=0.89,
+                chunk_id="global-chunk",
+                chunk_index=4,
+            )
+        ]
+
+    monkeypatch.setattr(chat_service, "list_local_document_candidates", fake_candidates)
+    monkeypatch.setattr(chat_service, "route_query_to_local_files", fake_route)
+    monkeypatch.setattr(chat_service, "retrieve_from_all_user_kbs", fake_retrieve_all)
+
+    create_response = client.post("/api/v1/chat/session", json={}, headers=headers)
+    session_id = create_response.json()["session_id"]
+    stream_response = client.post(
+        "/api/v1/chat/stream",
+        json={
+            "session_id": session_id,
+            "content": "请做全局本地搜索",
+            "search_mode": "local",
+        },
+        headers=headers,
+    )
+    events = parse_sse_events(stream_response.text)
+
+    assert stream_response.status_code == 200
+    assert [event["type"] for event in events] == ["delta", "delta", "done"]
+    assert events[2]["references"][0]["filename"] == "global.pdf"
+
+
+def test_chat_router_web_mode_returns_placeholder_error(chat_client) -> None:
+    client, _, _, owner_token, _ = chat_client
+    headers = {"Authorization": f"Bearer {owner_token}"}
+
+    create_response = client.post("/api/v1/chat/session", json={}, headers=headers)
+    session_id = create_response.json()["session_id"]
+    stream_response = client.post(
+        "/api/v1/chat/stream",
+        json={
+            "session_id": session_id,
+            "content": "搜索最新新闻",
+            "search_mode": "web",
+        },
+        headers=headers,
+    )
+    events = parse_sse_events(stream_response.text)
+
+    assert stream_response.status_code == 200
+    assert events == [
+        {
+            "type": "error",
+            "session_id": session_id,
+            "done": True,
+            "error": "网络搜索尚未接入",
+        }
+    ]
 
 
 def test_chat_router_hides_other_users_sessions(chat_client) -> None:

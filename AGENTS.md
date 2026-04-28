@@ -68,7 +68,8 @@ app/config/settings.py
 - `app/models/chat.py` 定义聊天会话与消息表；PG 保存完整历史，Redis 只保存短期上下文窗口。
 - `app/models/knowledge.py` 定义知识库与上传文档元数据表；PG 存储知识库、文件路径、文件状态和 chunk 数量，Milvus 存储后续 chunk 向量和 chunk metadata。
 - `app/service/session_service.py` 负责聊天会话、消息持久化、Redis 短期记忆裁剪与 OpenAI messages 格式化。
-- `app/service/chat_service.py` 负责聊天的完整流式编排，串联 ORM、Redis、LLM 与结构化 SSE 输出；当 `/chat/stream` 请求携带非空 `kb_ids` 时启用本地知识库 RAG，否则保持纯 LLM。
+- `app/service/chat_service.py` 负责聊天的完整流式编排，串联 ORM、Redis、LLM 与结构化 SSE 输出；`/chat/stream` 使用 `search_mode` 三态：`none` 纯 LLM，`local` 本地 RAG，`web` 预留网络搜索。
+- `app/service/local_file_router_service.py` 负责本地搜索的文件意图识别：读取当前用户已成功入库的非敏感文件元数据，让 LLM 严格输出可校验 JSON，再路由到具体文件、知识库或全库检索。
 - `app/service/llm_service.py` 是临时 OpenAI streaming 封装，后续可被 Agent/Deep Research 编排替换。
 - `app/service/embedding_service.py` 封装 OpenAI embedding 调用，后续知识库 chunk 向量化和 Milvus 入库必须复用该入口。
 - `app/service/milvus_service.py` 封装本地 Milvus collection、chunk 插入、dense vector 检索和删除操作；BM25/hybrid 检索后续放 retrieval 编排层。
@@ -101,7 +102,7 @@ app/config/settings.py
 - 改认证接口或用户 API：先读 `backend/app/schemas/user.py` -> `backend/app/core/security.py` -> `backend/app/core/redis_client.py` -> `backend/app/service/auth_service.py` -> `backend/app/router/auth_router.py` -> `backend/tests/test_auth.py`。
 - 改用户表或数据库字段：先读 `backend/app/core/database.py` -> `backend/app/models/user.py` -> `backend/app/models/__init__.py` -> `backend/alembic/env.py` -> `backend/alembic/versions/*` -> `backend/tests/test_user_model.py` -> `backend/tests/test_alembic_config.py`。
 - 改聊天会话、消息或流式回复：先读 `backend/app/models/chat.py` -> `backend/app/schemas/chat.py` -> `backend/app/service/session_service.py` -> `backend/app/service/chat_service.py` -> `backend/app/service/llm_service.py` -> `backend/app/router/chat_router.py` -> `backend/tests/test_chat_service.py` -> `backend/tests/test_chat_router.py`。
-- 改聊天 RAG：先读 `backend/app/schemas/chat.py` -> `backend/app/schemas/knowledge.py` -> `backend/app/service/retrieval_service.py` -> `backend/app/service/chat_service.py` -> `backend/app/router/chat_router.py` -> `backend/tests/test_chat_service.py` -> `backend/tests/test_chat_router.py` -> `backend/scripts/test_phase3_rag.py`。
+- 改聊天 RAG：先读 `backend/app/schemas/chat.py` -> `backend/app/schemas/knowledge.py` -> `backend/app/service/local_file_router_service.py` -> `backend/app/service/retrieval_service.py` -> `backend/app/service/chat_service.py` -> `backend/app/router/chat_router.py` -> `backend/tests/test_local_file_router_service.py` -> `backend/tests/test_chat_service.py` -> `backend/tests/test_chat_router.py` -> `backend/scripts/test_phase3_rag.py`。
 - 改知识库、上传文档或检索契约：先读 `backend/app/models/knowledge.py` -> `backend/app/schemas/knowledge.py` -> `backend/app/service/docmind_service.py` -> `backend/app/service/xlsx_service.py` -> `backend/app/service/document_service.py` -> `backend/app/service/embedding_service.py` -> `backend/app/service/milvus_service.py` -> `backend/app/service/retrieval_service.py` -> `backend/app/router/knowledge_router.py` -> `backend/app/router/document_router.py` -> `backend/app/core/milvus.py` -> `backend/alembic/versions/*` -> `backend/tests/test_knowledge_model.py` -> `backend/tests/test_knowledge_schemas.py`。
 - 改配置或环境变量：先读 `backend/.env.example` -> `backend/app/config/settings.py` -> 相关 `backend/app/core/*` 客户端 -> `backend/alembic/env.py` -> 对应测试。
 - 改业务服务：先读对应 `schemas` 和 `models` -> `backend/app/service/*` -> 调用它的 `router` -> 对应测试。
@@ -213,7 +214,9 @@ cd backend
   - 更新注册、登录、鉴权、Redis session 与密码哈希测试
 - 修改聊天会话、消息、Redis 短期记忆或 SSE：
  - 同步检查 `app/models/chat.py`、`app/schemas/chat.py`、`app/service/session_service.py`、`app/service/chat_service.py`、`app/service/llm_service.py`、`app/router/chat_router.py`
-  - RAG 只能由非空 `kb_ids` 显式触发；纯聊天路径不得调用 embedding、Milvus 或 retrieval
+  - RAG 由 `search_mode="local"` 触发；纯聊天路径 `search_mode="none"` 不得调用 embedding、Milvus 或 retrieval
+  - 上传仍按 KnowledgeBase 分类；问答端不暴露高级筛选，具体文件/知识库选择由 `local_file_router_service.py` 自动识别
+  - `search_mode="web"` 当前只返回“网络搜索尚未接入”，Phase 4 再接 Bocha
   - RAG 增强 prompt 不得写入 PG/Redis，PG/Redis 只保存用户原始问题和 assistant 回答
   - `ChatSSEChunk.references` 只在最终 `done` 事件中返回，编号必须与 prompt 中 `[编号]` 一致
   - 模型字段变化必须新增 Alembic migration

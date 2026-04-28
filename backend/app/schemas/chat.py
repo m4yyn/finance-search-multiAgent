@@ -57,14 +57,7 @@ class ChatStreamRequest(SendMessageRequest):
     """Stream one user message to an existing chat session."""
 
     session_id: UUID
-    kb_ids: list[UUID] | None = None
-
-    @field_validator("kb_ids")
-    @classmethod
-    def normalize_kb_ids(cls, value: list[UUID] | None) -> list[UUID] | None:
-        if not value:
-            return None
-        return list(dict.fromkeys(value))
+    search_mode: Literal["none", "local", "web"] = "none"
 
 
 class ChatMessageResponse(BaseModel):

@@ -27,7 +27,7 @@ def test_chat_schemas_validate_expected_fields() -> None:
     stream_payload = ChatStreamRequest(
         session_id=session_id,
         content="  分析贵州茅台  ",
-        kb_ids=[kb_id, kb_id],
+        search_mode="local",
     )
     created_response = ChatSessionCreatedResponse(session_id=session_id, title="投资研究")
     session_response = ChatSessionResponse(
@@ -67,7 +67,7 @@ def test_chat_schemas_validate_expected_fields() -> None:
     assert create_payload.title == "投资 研究"
     assert send_payload.content == "分析银行板块"
     assert stream_payload.content == "分析贵州茅台"
-    assert stream_payload.kb_ids == [kb_id]
+    assert stream_payload.search_mode == "local"
     assert created_response.session_id == session_id
     assert session_response.user_id == user_id
     assert message_response.role == "assistant"
@@ -78,3 +78,8 @@ def test_chat_schemas_validate_expected_fields() -> None:
 def test_send_message_rejects_blank_content() -> None:
     with pytest.raises(ValidationError):
         SendMessageRequest(content="   ")
+
+
+def test_chat_stream_rejects_unknown_search_mode() -> None:
+    with pytest.raises(ValidationError):
+        ChatStreamRequest(session_id=uuid4(), content="hello", search_mode="hybrid")

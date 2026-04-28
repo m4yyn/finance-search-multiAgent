@@ -189,6 +189,8 @@ def vector_search(
     owned_client = client is None
     milvus_client = _get_client(client)
     try:
+        if not milvus_client.has_collection(collection_name):
+            return []
         results = milvus_client.search(
             collection_name=collection_name,
             data=[query_vector],

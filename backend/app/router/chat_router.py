@@ -94,7 +94,7 @@ async def stream_message(
             payload.session_id,
             current_user.id,
             payload.content,
-            payload.kb_ids,
+            payload.search_mode,
         ),
         media_type="text/event-stream",
         headers={

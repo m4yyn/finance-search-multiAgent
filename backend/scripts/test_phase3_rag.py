@@ -301,14 +301,14 @@ def stream_chat(
     token: str,
     session_id: str,
     content: str,
-    kb_ids: list[str] | None = None,
+    search_mode: str = "none",
 ) -> tuple[str, list[dict]]:
-    print(f"\nStreaming prompt: {content} kb_ids={kb_ids or []}")
+    print(f"\nStreaming prompt: {content} search_mode={search_mode}")
     answer_parts: list[str] = []
     events: list[dict] = []
     payload: dict[str, object] = {"session_id": session_id, "content": content}
-    if kb_ids:
-        payload["kb_ids"] = kb_ids
+    if search_mode != "none":
+        payload["search_mode"] = search_mode
 
     with client.stream(
         "POST",
@@ -390,7 +390,7 @@ def main() -> None:
                 token,
                 session_id,
                 RAG_QUERY,
-                [kb_id],
+                search_mode="local",
             )
             done_event = rag_events[-1]
             references = done_event.get("references") or []

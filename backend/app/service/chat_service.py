@@ -9,7 +9,15 @@ from app.models import ChatMessage, ChatSession
 from app.schemas.chat import ChatReference, ChatSSEChunk
 from app.schemas.knowledge import RetrivalChunk
 from app.service import llm_service
-from app.service.retrieval_service import retrieve_from_kbs
+from app.service.local_file_router_service import (
+    list_local_document_candidates,
+    route_query_to_local_files,
+)
+from app.service.retrieval_service import (
+    retrieve_from_all_user_kbs,
+    retrieve_from_documents,
+    retrieve_from_kbs,
+)
 from app.service.session_service import (
     add_message,
     create_chat_session,
@@ -137,9 +145,20 @@ async def stream_chat_response(
     session_id: UUID,
     user_id: UUID,
     user_content: str,
-    kb_ids: list[UUID] | None = None,
+    search_mode: str = "none",
 ) -> AsyncGenerator[str, None]:
     """Persist a user message, stream the LLM reply, then persist assistant output."""
+    if search_mode == "web":
+        yield format_sse_chunk(
+            ChatSSEChunk(
+                type="error",
+                session_id=session_id,
+                done=True,
+                error="网络搜索尚未接入",
+            )
+        )
+        return
+
     async with sessionmaker() as db:
         await add_message(db, redis_cache, session_id, "user", user_content)
         history_messages = await get_formatted_history_messages(
@@ -149,14 +168,34 @@ async def stream_chat_response(
         )
         references: list[ChatReference] = []
         llm_messages = history_messages
-        if kb_ids:
-            retrieved_chunks = await retrieve_from_kbs(
-                db,
-                user_id,
-                kb_ids,
-                user_content,
-                top_k=5,
-            )
+        if search_mode == "local":
+            candidates = await list_local_document_candidates(db, user_id)
+            route = await route_query_to_local_files(user_content, candidates)
+            if route.route == "documents":
+                retrieved_chunks = await retrieve_from_documents(
+                    db,
+                    user_id,
+                    route.document_ids,
+                    user_content,
+                    top_k=5,
+                )
+            elif route.route == "knowledge_bases":
+                retrieved_chunks = await retrieve_from_kbs(
+                    db,
+                    user_id,
+                    route.kb_ids,
+                    user_content,
+                    top_k=5,
+                )
+            elif route.route == "all":
+                retrieved_chunks = await retrieve_from_all_user_kbs(
+                    db,
+                    user_id,
+                    user_content,
+                    top_k=5,
+                )
+            else:
+                retrieved_chunks = []
             references = build_chat_references(retrieved_chunks)
             rag_prompt = build_rag_prompt(user_content, references)
             llm_messages = [
