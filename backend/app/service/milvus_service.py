@@ -14,6 +14,13 @@ CONTENT_FIELD = "content"
 VECTOR_FIELD = "vector"
 DEFAULT_METRIC_TYPE = "COSINE"
 MAX_CONTENT_LENGTH = 65535
+MEMORY_COLLECTION_NAME = "long_term_memories"
+MEMORY_VECTOR_ID_FIELD = "memory_vector_id"
+MEMORY_ID_FIELD = "memory_id"
+MEMORY_USER_ID_FIELD = "user_id"
+MEMORY_SESSION_ID_FIELD = "session_id"
+MEMORY_SUMMARY_FIELD = "summary"
+MEMORY_CREATED_AT_FIELD = "created_at"
 
 
 def _get_client(client: MilvusClient | None = None) -> MilvusClient:
@@ -75,6 +82,55 @@ def _normalize_chunk(chunk: dict[str, Any], dimension: int) -> dict[str, Any]:
             raise ValueError(f"{field_name} cannot be blank.")
         normalized[field_name] = value
 
+    if len(normalized[CONTENT_FIELD]) > MAX_CONTENT_LENGTH:
+        raise ValueError(f"{CONTENT_FIELD} exceeds {MAX_CONTENT_LENGTH} characters.")
+    normalized[VECTOR_FIELD] = vector
+    return normalized
+
+
+def _normalize_memory_vector(memory: dict[str, Any], dimension: int) -> dict[str, Any]:
+    required_fields = {
+        MEMORY_VECTOR_ID_FIELD,
+        MEMORY_ID_FIELD,
+        MEMORY_USER_ID_FIELD,
+        MEMORY_SUMMARY_FIELD,
+        CONTENT_FIELD,
+        VECTOR_FIELD,
+    }
+    missing_fields = required_fields - set(memory)
+    if missing_fields:
+        missing = ", ".join(sorted(missing_fields))
+        raise ValueError(f"Memory vector is missing required fields: {missing}.")
+
+    vector = list(memory[VECTOR_FIELD])
+    if len(vector) != dimension:
+        raise ValueError(
+            f"Vector dimension mismatch: expected {dimension}, got {len(vector)}."
+        )
+
+    normalized = dict(memory)
+    for field_name in [
+        MEMORY_VECTOR_ID_FIELD,
+        MEMORY_ID_FIELD,
+        MEMORY_USER_ID_FIELD,
+        MEMORY_SUMMARY_FIELD,
+        CONTENT_FIELD,
+    ]:
+        value = str(normalized[field_name]).strip()
+        if not value:
+            raise ValueError(f"{field_name} cannot be blank.")
+        normalized[field_name] = value
+
+    normalized[MEMORY_SESSION_ID_FIELD] = str(
+        normalized.get(MEMORY_SESSION_ID_FIELD) or ""
+    )
+    normalized[MEMORY_CREATED_AT_FIELD] = str(
+        normalized.get(MEMORY_CREATED_AT_FIELD) or ""
+    )
+    if len(normalized[MEMORY_SUMMARY_FIELD]) > MAX_CONTENT_LENGTH:
+        raise ValueError(
+            f"{MEMORY_SUMMARY_FIELD} exceeds {MAX_CONTENT_LENGTH} characters."
+        )
     if len(normalized[CONTENT_FIELD]) > MAX_CONTENT_LENGTH:
         raise ValueError(f"{CONTENT_FIELD} exceeds {MAX_CONTENT_LENGTH} characters.")
     normalized[VECTOR_FIELD] = vector
@@ -144,6 +200,81 @@ def create_collection(
         _close_owned_client(milvus_client, owned_client)
 
 
+def create_memory_collection(
+    dimension: int | None = None,
+    *,
+    client: MilvusClient | None = None,
+    metric_type: str = DEFAULT_METRIC_TYPE,
+) -> bool:
+    """Create the dedicated long-term memory collection, skipping existing ones."""
+    settings = get_settings()
+    dimension = _validate_dimension(dimension or settings.embedding_dim)
+    owned_client = client is None
+    milvus_client = _get_client(client)
+    try:
+        if milvus_client.has_collection(MEMORY_COLLECTION_NAME):
+            return False
+
+        schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=True)
+        schema.add_field(
+            field_name=MEMORY_VECTOR_ID_FIELD,
+            datatype=DataType.VARCHAR,
+            is_primary=True,
+            max_length=128,
+        )
+        schema.add_field(
+            field_name=MEMORY_ID_FIELD,
+            datatype=DataType.VARCHAR,
+            max_length=64,
+        )
+        schema.add_field(
+            field_name=MEMORY_USER_ID_FIELD,
+            datatype=DataType.VARCHAR,
+            max_length=64,
+        )
+        schema.add_field(
+            field_name=MEMORY_SESSION_ID_FIELD,
+            datatype=DataType.VARCHAR,
+            max_length=64,
+        )
+        schema.add_field(
+            field_name=MEMORY_SUMMARY_FIELD,
+            datatype=DataType.VARCHAR,
+            max_length=MAX_CONTENT_LENGTH,
+        )
+        schema.add_field(
+            field_name=CONTENT_FIELD,
+            datatype=DataType.VARCHAR,
+            max_length=MAX_CONTENT_LENGTH,
+        )
+        schema.add_field(
+            field_name=MEMORY_CREATED_AT_FIELD,
+            datatype=DataType.VARCHAR,
+            max_length=64,
+        )
+        schema.add_field(
+            field_name=VECTOR_FIELD,
+            datatype=DataType.FLOAT_VECTOR,
+            dim=dimension,
+        )
+
+        index_params = milvus_client.prepare_index_params()
+        index_params.add_index(
+            field_name=VECTOR_FIELD,
+            index_type="AUTOINDEX",
+            metric_type=metric_type,
+        )
+        milvus_client.create_collection(
+            collection_name=MEMORY_COLLECTION_NAME,
+            schema=schema,
+            index_params=index_params,
+            consistency_level="Strong",
+        )
+        return True
+    finally:
+        _close_owned_client(milvus_client, owned_client)
+
+
 def batch_insert(
     collection_name: str,
     chunks: list[dict[str, Any]],
@@ -164,6 +295,33 @@ def batch_insert(
     try:
         result = milvus_client.insert(collection_name=collection_name, data=data)
         milvus_client.flush(collection_name)
+        return result
+    finally:
+        _close_owned_client(milvus_client, owned_client)
+
+
+def insert_memory_vectors(
+    memories: list[dict[str, Any]],
+    *,
+    client: MilvusClient | None = None,
+    dimension: int | None = None,
+) -> dict[str, Any]:
+    """Insert vectors into the dedicated long-term memory collection."""
+    if not memories:
+        return {"insert_count": 0, "ids": []}
+
+    settings = get_settings()
+    dimension = _validate_dimension(dimension or settings.embedding_dim)
+    data = [_normalize_memory_vector(memory, dimension) for memory in memories]
+    owned_client = client is None
+    milvus_client = _get_client(client)
+    try:
+        create_memory_collection(
+            dimension=dimension,
+            client=milvus_client,
+        )
+        result = milvus_client.insert(collection_name=MEMORY_COLLECTION_NAME, data=data)
+        milvus_client.flush(MEMORY_COLLECTION_NAME)
         return result
     finally:
         _close_owned_client(milvus_client, owned_client)
@@ -212,6 +370,52 @@ def vector_search(
         _close_owned_client(milvus_client, owned_client)
 
 
+def search_memory_vectors(
+    query_vector: list[float],
+    user_id: str,
+    *,
+    client: MilvusClient | None = None,
+    limit: int = 3,
+    output_fields: list[str] | None = None,
+    metric_type: str = DEFAULT_METRIC_TYPE,
+) -> list[dict[str, Any]]:
+    """Search long-term memory vectors scoped to one user."""
+    if limit < 1:
+        raise ValueError("limit must be greater than 0.")
+    if not query_vector:
+        raise ValueError("query_vector cannot be empty.")
+    user_id = user_id.strip()
+    if not user_id:
+        raise ValueError("user_id cannot be blank.")
+
+    owned_client = client is None
+    milvus_client = _get_client(client)
+    try:
+        if not milvus_client.has_collection(MEMORY_COLLECTION_NAME):
+            return []
+        results = milvus_client.search(
+            collection_name=MEMORY_COLLECTION_NAME,
+            data=[query_vector],
+            anns_field=VECTOR_FIELD,
+            filter=f'{MEMORY_USER_ID_FIELD} == "{_escape_expr_value(user_id)}"',
+            limit=limit,
+            output_fields=output_fields
+            or [
+                MEMORY_VECTOR_ID_FIELD,
+                MEMORY_ID_FIELD,
+                MEMORY_USER_ID_FIELD,
+                MEMORY_SESSION_ID_FIELD,
+                MEMORY_SUMMARY_FIELD,
+                CONTENT_FIELD,
+                MEMORY_CREATED_AT_FIELD,
+            ],
+            search_params={"metric_type": metric_type},
+        )
+        return list(results[0]) if results else []
+    finally:
+        _close_owned_client(milvus_client, owned_client)
+
+
 def count_collection_rows(
     collection_name: str,
     *,
@@ -226,6 +430,34 @@ def count_collection_rows(
             return 0
         stats = milvus_client.get_collection_stats(collection_name)
         return int(stats.get("row_count") or 0)
+    finally:
+        _close_owned_client(milvus_client, owned_client)
+
+
+def delete_memory_vectors(
+    memory_id: str,
+    *,
+    client: MilvusClient | None = None,
+) -> dict[str, int]:
+    """Delete all vectors belonging to one long-term memory."""
+    memory_id = memory_id.strip()
+    if not memory_id:
+        raise ValueError("memory_id cannot be blank.")
+
+    owned_client = client is None
+    milvus_client = _get_client(client)
+    try:
+        if not milvus_client.has_collection(MEMORY_COLLECTION_NAME):
+            return {"delete_count": 0, "ids": []}
+        milvus_client.load_collection(MEMORY_COLLECTION_NAME)
+        result = milvus_client.delete(
+            collection_name=MEMORY_COLLECTION_NAME,
+            filter=f'{MEMORY_ID_FIELD} == "{_escape_expr_value(memory_id)}"',
+        )
+        milvus_client.flush(MEMORY_COLLECTION_NAME)
+        if isinstance(result, list):
+            return {"delete_count": len(result), "ids": result}
+        return result
     finally:
         _close_owned_client(milvus_client, owned_client)
 

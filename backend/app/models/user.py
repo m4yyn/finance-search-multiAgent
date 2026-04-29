@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, DateTime, String, Uuid
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 
@@ -37,4 +37,9 @@ class User(Base):
         default=utc_now,
         onupdate=utc_now,
         nullable=False,
+    )
+    memories: Mapped[list["LongTermMemory"]] = relationship(
+        "LongTermMemory",
+        back_populates="user",
+        passive_deletes=True,
     )

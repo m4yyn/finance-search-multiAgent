@@ -1,4 +1,5 @@
 import json
+import logging
 from collections.abc import AsyncGenerator
 from uuid import UUID
 
@@ -20,6 +21,10 @@ from app.service.retrieval_service import (
     retrieve_from_kbs,
 )
 from app.service.search_service import format_web_references_for_prompt, search_web
+from app.service.memory_service import (
+    build_memory_context_for_query,
+    safe_maybe_create_memory_from_session,
+)
 from app.service.session_service import (
     add_message,
     create_chat_session,
@@ -31,6 +36,8 @@ from app.service.session_service import (
 )
 
 
+logger = logging.getLogger(__name__)
+
 RAG_PROMPT_TEMPLATE = """你是金融行业信息助手。请严格基于以下参考资料回答用户问题。
 
 要求：
@@ -38,6 +45,10 @@ RAG_PROMPT_TEMPLATE = """你是金融行业信息助手。请严格基于以下�
 2. 凡引用参考资料中的事实或数字，必须用 [编号] 标注来源。
 3. 如果参考资料不足以回答，请明确说明“本地知识库未提供足够依据”，不要编造数字。
 4. 如果不同参考资料冲突，请指出冲突并说明你采用的依据。
+5. 相关历史记忆只用于理解用户偏好和历史上下文，不能替代参考资料作为事实依据。
+
+相关历史记忆：
+{memory_context}
 
 参考资料：
 {formatted_refs}
@@ -54,6 +65,10 @@ WEB_SEARCH_PROMPT_TEMPLATE = """你是金融行业信息助手。请基于以下
 3. 如果联网搜索资料不足以回答，请明确说明“联网搜索未提供足够依据”，不要编造事实或数据。
 4. 如果资料之间存在时间或口径差异，请说明差异并优先使用更新、更权威的来源。
 5. 不要声称读取了用户本地文件；本回答只基于联网搜索资料。
+6. 相关历史记忆只用于理解用户偏好和历史上下文，不能替代联网搜索资料作为事实依据。
+
+相关历史记忆：
+{memory_context}
 
 联网搜索资料：
 {formatted_refs}
@@ -89,12 +104,25 @@ ORDINARY_CHAT_SYSTEM_PROMPT = """你是“金融行业信息报告编写 Agent �
 
 def build_ordinary_chat_messages(
     history_messages: list[dict[str, str]],
+    memory_context: str = "",
 ) -> list[dict[str, str]]:
     """Prepend the ordinary-chat guardrail prompt without persisting it to history."""
-    return [
+    messages = [
         {"role": "system", "content": ORDINARY_CHAT_SYSTEM_PROMPT},
-        *history_messages,
     ]
+    if memory_context:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    f"{memory_context}\n\n"
+                    "以上长期记忆只用于理解用户偏好、历史研究方向和上下文，"
+                    "不得把它当作实时事实来源或用户本地文件内容。"
+                ),
+            }
+        )
+    messages.extend(history_messages)
+    return messages
 
 
 def format_sse_chunk(chunk: ChatSSEChunk) -> str:
@@ -213,18 +241,40 @@ def format_references_for_prompt(references: list[ChatReference]) -> str:
     return "\n\n".join(formatted_refs)
 
 
-def build_rag_prompt(question: str, references: list[ChatReference]) -> str:
+def build_rag_prompt(
+    question: str,
+    references: list[ChatReference],
+    memory_context: str = "",
+) -> str:
     return RAG_PROMPT_TEMPLATE.format(
+        memory_context=memory_context or "无相关历史记忆。",
         formatted_refs=format_references_for_prompt(references),
         question=question,
     )
 
 
-def build_web_search_prompt(question: str, results: list[WebSearchResult]) -> str:
+def build_web_search_prompt(
+    question: str,
+    results: list[WebSearchResult],
+    memory_context: str = "",
+) -> str:
     return WEB_SEARCH_PROMPT_TEMPLATE.format(
+        memory_context=memory_context or "无相关历史记忆。",
         formatted_refs=format_web_references_for_prompt(results),
         question=question,
     )
+
+
+async def _build_memory_context_safely(
+    db: AsyncSession,
+    user_id: UUID,
+    user_content: str,
+) -> str:
+    try:
+        return await build_memory_context_for_query(db, user_id, user_content)
+    except Exception:
+        logger.exception("Failed to retrieve long-term memory context.")
+        return ""
 
 
 async def stream_chat_response(
@@ -246,7 +296,15 @@ async def stream_chat_response(
         assistant_content_parts: list[str] = []
         try:
             references: list[ChatReference] = []
-            llm_messages = build_ordinary_chat_messages(history_messages)
+            memory_context = await _build_memory_context_safely(
+                db,
+                user_id,
+                user_content,
+            )
+            llm_messages = build_ordinary_chat_messages(
+                history_messages,
+                memory_context,
+            )
             if search_mode == "local":
                 candidates = await list_local_document_candidates(db, user_id)
                 route = await route_query_to_local_files(user_content, candidates)
@@ -276,7 +334,7 @@ async def stream_chat_response(
                 else:
                     retrieved_chunks = []
                 references = build_chat_references(retrieved_chunks)
-                rag_prompt = build_rag_prompt(user_content, references)
+                rag_prompt = build_rag_prompt(user_content, references, memory_context)
                 llm_messages = [
                     *history_messages[:-1],
                     {"role": "user", "content": rag_prompt},
@@ -284,7 +342,11 @@ async def stream_chat_response(
             elif search_mode == "web":
                 web_response = await search_web(redis_cache, user_content, count=5)
                 references = build_web_search_references(web_response.results)
-                web_prompt = build_web_search_prompt(user_content, web_response.results)
+                web_prompt = build_web_search_prompt(
+                    user_content,
+                    web_response.results,
+                    memory_context,
+                )
                 llm_messages = [
                     *history_messages[:-1],
                     {"role": "user", "content": web_prompt},
@@ -303,6 +365,7 @@ async def stream_chat_response(
                 "assistant",
                 "".join(assistant_content_parts),
             )
+            await safe_maybe_create_memory_from_session(db, user_id, session_id)
             yield format_sse_chunk(
                 ChatSSEChunk(
                     type="done",

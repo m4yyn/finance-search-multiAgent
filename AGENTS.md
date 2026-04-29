@@ -85,6 +85,9 @@ app/config/settings.py
 - `app/service/retrieval_service.py` 负责知识库 dense vector 召回，支持单 KB 和多 KB 合并排序。
 - 聊天 RAG 的引用对象由 `app/schemas/chat.py` 的 `ChatReference` 表达，并随最终 `done` SSE 事件返回给前端；增强 prompt 只传给 LLM，不写入 PG/Redis 历史。
 - `app/service/search_service.py` 负责 Bocha 联网搜索和 Redis 短缓存；缓存 key 必须使用 `web_search:bocha:` 前缀，避免与本地 RAG、聊天 session 短期记忆混用。
+- `app/models/chat.py` 中的 `LongTermMemory` 保存长期记忆摘要；PG 记录用户、会话、摘要、关键洞察和 Milvus 向量 ID，Milvus 独立 collection `long_term_memories` 保存长期记忆向量。
+- `app/service/memory_service.py` 负责长期记忆创建、LLM 总结压缩、embedding、Milvus 写入、召回和 prompt context 组装；聊天流程只注入 memory context，不把 memory context 写回 PG/Redis。
+- `app/router/memory_router.py` 是长期记忆手动创建、搜索和 context 预览接口入口。
 - `app/router/knowledge_router.py` 是知识库创建、列表、删除和测试召回接口入口。
 - `GET /api/v1/knowledge/bases/{kb_id}/stats` 用于验收和诊断 PG chunk_count 与 Milvus row_count 是否一致。
 - `app/router/document_router.py` 是知识库文档上传、列表和删除接口入口，上传后用后台任务触发入库。
@@ -112,6 +115,7 @@ app/config/settings.py
 - 改认证接口或用户 API：先读 `backend/app/schemas/user.py` -> `backend/app/core/security.py` -> `backend/app/core/redis_client.py` -> `backend/app/service/auth_service.py` -> `backend/app/router/auth_router.py` -> `backend/tests/test_auth.py`。
 - 改用户表或数据库字段：先读 `backend/app/core/database.py` -> `backend/app/models/user.py` -> `backend/app/models/__init__.py` -> `backend/alembic/env.py` -> `backend/alembic/versions/*` -> `backend/tests/test_user_model.py` -> `backend/tests/test_alembic_config.py`。
 - 改聊天会话、消息或流式回复：先读 `backend/app/models/chat.py` -> `backend/app/schemas/chat.py` -> `backend/app/service/session_service.py` -> `backend/app/service/chat_service.py` -> `backend/app/service/llm_service.py` -> `backend/app/router/chat_router.py` -> `backend/tests/test_chat_service.py` -> `backend/tests/test_chat_router.py`。
+- 改长期记忆：先读 `backend/app/models/chat.py` -> `backend/app/schemas/memory.py` -> `backend/app/service/memory_service.py` -> `backend/app/service/milvus_service.py` -> `backend/app/service/chat_service.py` -> `backend/app/router/memory_router.py` -> `backend/tests/test_memory_service.py` -> `backend/tests/test_memory_router.py`。
 - 改聊天 RAG：先读 `backend/app/schemas/chat.py` -> `backend/app/schemas/knowledge.py` -> `backend/app/service/local_file_router_service.py` -> `backend/app/service/retrieval_service.py` -> `backend/app/service/chat_service.py` -> `backend/app/router/chat_router.py` -> `backend/tests/test_local_file_router_service.py` -> `backend/tests/test_chat_service.py` -> `backend/tests/test_chat_router.py` -> `backend/scripts/test_phase3_rag.py`。
 - 改知识库、上传文档或检索契约：先读 `backend/app/models/knowledge.py` -> `backend/app/schemas/knowledge.py` -> `backend/app/service/docmind_service.py` -> `backend/app/service/xlsx_service.py` -> `backend/app/service/document_service.py` -> `backend/app/service/embedding_service.py` -> `backend/app/service/milvus_service.py` -> `backend/app/service/retrieval_service.py` -> `backend/app/router/knowledge_router.py` -> `backend/app/router/document_router.py` -> `backend/app/core/milvus.py` -> `backend/alembic/versions/*` -> `backend/tests/test_knowledge_model.py` -> `backend/tests/test_knowledge_schemas.py`。
 - 改配置或环境变量：先读 `backend/.env.example` -> `backend/app/config/settings.py` -> 相关 `backend/app/core/*` 客户端 -> `backend/alembic/env.py` -> 对应测试。
@@ -142,6 +146,9 @@ GET /api/v1/chat/sessions
 POST /api/v1/chat/stream
 DELETE /api/v1/chat/session/{session_id}
 GET /api/v1/chat/session/{session_id}/messages
+POST /api/v1/memories/create
+POST /api/v1/memories/search
+GET /api/v1/memories/context/{query}
 POST /api/v1/knowledge/bases
 GET /api/v1/knowledge/bases
 DELETE /api/v1/knowledge/bases/{kb_id}
@@ -235,8 +242,15 @@ cd backend
   - 删除研究记录必须使用 `is_active=False` 软删除，并清理对应 Redis 短期记忆；不得默认物理删除 PG `chat_messages`
   - RAG 增强 prompt 不得写入 PG/Redis，PG/Redis 只保存用户原始问题和 assistant 回答
   - `ChatSSEChunk.references` 只在最终 `done` 事件中返回，编号必须与 prompt 中 `[编号]` 一致
+  - 长期记忆 context 可注入普通聊天、本地 RAG 和联网搜索 prompt；它只代表历史偏好和上下文，不得作为本地资料或联网事实来源
+  - 自动长期记忆创建失败不得中断 SSE；失败只能记录日志并保持用户聊天回答正常返回
   - 模型字段变化必须新增 Alembic migration
   - 更新模型、schema、service、LLM stream 和 chat router 测试
+- 修改长期记忆：
+  - 同步检查 `app/models/chat.py`、`app/schemas/memory.py`、`app/service/memory_service.py`、`app/service/milvus_service.py`、`app/router/memory_router.py`、`app/router/api.py`
+  - `long_term_memories` 表字段变化必须新增 Alembic migration
+  - Milvus 长期记忆必须使用独立 `long_term_memories` collection，不得和知识库 KB collection 混写
+  - 长期记忆召回必须按当前 JWT 用户 `user_id` 过滤，不得跨用户返回
 - 修改知识库、上传文档、文件类型或检索契约：
   - 同步检查 `app/models/knowledge.py`、`app/schemas/knowledge.py`、`app/service/docmind_service.py`、`app/service/xlsx_service.py`、`app/service/document_service.py`、`app/service/embedding_service.py`、`app/service/milvus_service.py`、`app/service/retrieval_service.py`、`app/router/knowledge_router.py`、`app/router/document_router.py`、`app/core/milvus.py`
   - 模型字段变化必须新增 Alembic migration

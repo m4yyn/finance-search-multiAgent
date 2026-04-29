@@ -176,6 +176,85 @@ def test_chat_service_stream_success_persists_user_and_assistant(monkeypatch) ->
     asyncio.run(run_check())
 
 
+def test_chat_service_injects_long_term_memory_context_without_persisting_it(
+    monkeypatch,
+) -> None:
+    async def run_check() -> None:
+        session, sessionmaker, redis_cache, user = await build_context()
+        try:
+            monkeypatch.setattr(session_service, "count_message_tokens", lambda _: 1)
+
+            async def fake_memory_context(db, user_id, query):  # noqa: ANN001
+                assert user_id == user.id
+                assert query == "继续分析白酒行业"
+                return "[相关历史记忆]\n[1] 用户关注白酒行业盈利能力。"
+
+            async def fake_safe_maybe(db, user_id, session_id):  # noqa: ANN001
+                assert user_id == user.id
+
+            async def fake_stream(
+                messages: list[dict[str, str]],
+            ) -> AsyncGenerator[str, None]:
+                assert messages[0]["role"] == "system"
+                assert messages[0]["content"] == chat_service.ORDINARY_CHAT_SYSTEM_PROMPT
+                assert messages[1]["role"] == "system"
+                assert "[相关历史记忆]" in messages[1]["content"]
+                assert messages[-1] == {"role": "user", "content": "继续分析白酒行业"}
+                yield "继续分析"
+
+            monkeypatch.setattr(
+                chat_service,
+                "build_memory_context_for_query",
+                fake_memory_context,
+            )
+            monkeypatch.setattr(
+                chat_service,
+                "safe_maybe_create_memory_from_session",
+                fake_safe_maybe,
+            )
+            monkeypatch.setattr(chat_service.llm_service, "stream_chat_completion", fake_stream)
+
+            chat_session = await create_user_chat_session(session, user.id)
+            chunks = [
+                chunk
+                async for chunk in stream_chat_response(
+                    sessionmaker,
+                    redis_cache,
+                    chat_session.id,
+                    user.id,
+                    "继续分析白酒行业",
+                )
+            ]
+            events = parse_sse_events(chunks)
+            messages = list(
+                (
+                    await session.execute(
+                        select(ChatMessage)
+                        .where(ChatMessage.session_id == chat_session.id)
+                        .order_by(ChatMessage.created_at.asc(), ChatMessage.id.asc())
+                    )
+                ).scalars()
+            )
+            redis_messages = await redis_cache.get_list(
+                session_service.get_chat_redis_key(chat_session.id)
+            )
+
+            assert [event["type"] for event in events] == ["delta", "done"]
+            assert [message.content for message in messages] == [
+                "继续分析白酒行业",
+                "继续分析",
+            ]
+            assert all("[相关历史记忆]" not in message.content for message in messages)
+            assert all(
+                "[相关历史记忆]" not in message["content"]
+                for message in redis_messages
+            )
+        finally:
+            await close_context(session)
+
+    asyncio.run(run_check())
+
+
 def test_chat_service_stream_with_local_document_route_uses_references_without_storing_prompt(
     monkeypatch,
 ) -> None:
