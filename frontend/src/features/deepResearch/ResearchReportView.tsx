@@ -52,7 +52,7 @@ export function ResearchReportView({
   )
 }
 
-function MarkdownPreview({ content }: { content: string }) {
+export function MarkdownPreview({ content }: { content: string }) {
   const blocks = content.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean)
   return (
     <div className="report-markdown">

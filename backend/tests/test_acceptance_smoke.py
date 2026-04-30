@@ -162,7 +162,7 @@ def test_task_5_alembic_current_and_pg_users_table_exist() -> None:
     output = f"{result.stdout}\n{result.stderr}"
 
     assert result.returncode == 0
-    assert "202604290004" in output
+    assert "202604290005" in output
     assert run_async(db_scalar("select to_regclass('public.users')")) == "users"
     assert (
         run_async(db_scalar("select to_regclass('public.chat_sessions')"))

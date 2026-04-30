@@ -144,6 +144,7 @@ export interface ResearchStepEvent {
 export interface KnowledgeGraphNode {
   id: string
   label?: string
+  display_label?: string
   name?: string
   type?: string
   importance?: number

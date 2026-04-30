@@ -10,14 +10,12 @@ import {
   Sparkles,
   Trash2,
 } from 'lucide-react'
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as chatApi from '../../api/chat'
 import * as deepResearchApi from '../../api/deepResearch'
 import * as knowledgeApi from '../../api/knowledge'
-import { KnowledgeGraphView } from '../deepResearch/KnowledgeGraphView'
-import { ReportChartsView } from '../deepResearch/ReportChartsView'
-import { ResearchEventPanel } from '../deepResearch/ResearchEventPanel'
-import { ResearchReportView } from '../deepResearch/ResearchReportView'
+import { DeepResearchWorkspace } from '../deepResearch/DeepResearchWorkspace'
+import { MarkdownPreview } from '../deepResearch/ResearchReportView'
 import { useAuth } from '../auth/AuthProvider'
 import { KnowledgePanel } from '../knowledge/KnowledgePanel'
 import { toSearchMode, toggleSearchMode, type SearchToggle } from './searchMode'
@@ -56,12 +54,6 @@ const SAMPLE_PROMPTS = [
   '帮我设计一份上市公司年报分析框架',
 ]
 
-const EChartsView = lazy(() =>
-  import('../deepResearch/EChartsView').then((module) => ({
-    default: module.EChartsView,
-  })),
-)
-
 export function WorkspacePage() {
   const { user, logout } = useAuth()
   const [sidebarTab, setSidebarTab] = useState<'chat' | 'files'>('chat')
@@ -71,6 +63,7 @@ export function WorkspacePage() {
   const [input, setInput] = useState('')
   const [searchToggle, setSearchToggle] = useState<SearchToggle>(null)
   const [deepResearchMode, setDeepResearchMode] = useState(false)
+  const [researchWorkspaceOpen, setResearchWorkspaceOpen] = useState(true)
   const [streaming, setStreaming] = useState(false)
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null)
   const [error, setError] = useState('')
@@ -187,6 +180,9 @@ export function WorkspacePage() {
     setError('')
     setInput('')
     setStreaming(true)
+    if (deepResearchMode) {
+      setResearchWorkspaceOpen(true)
+    }
 
     try {
       let sessionId = activeSessionId
@@ -296,6 +292,11 @@ export function WorkspacePage() {
       (event) => {
         appendResearchEvent(assistantId, event)
         if (event.type === 'done') {
+          const doneContent = asRecord(event.content)
+          const finalReport =
+            typeof doneContent.final_report === 'string'
+              ? normalizeReportText(doneContent.final_report)
+              : ''
           const summary = asRecord(asRecord(event.content).summary)
           const chartsCount = Number(summary.charts_count ?? 0)
           const reportChartsCount = Number(summary.report_charts_count ?? 0)
@@ -320,7 +321,9 @@ export function WorkspacePage() {
                 ? {
                     ...message,
                     streaming: false,
-                    content: `Deep Research 已完成：沉淀 ${factsCount} 条事实，生成 ${chartsCount} 个图表${reportChartText}${reportText}${reviewText}${issueText}。`,
+                    content:
+                      finalReport ||
+                      `Deep Research 已完成：沉淀 ${factsCount} 条事实，生成 ${chartsCount} 个图表${reportChartText}${reportText}${reviewText}${issueText}。`,
                   }
                 : message,
             ),
@@ -370,6 +373,12 @@ export function WorkspacePage() {
     () => sessions.find((session) => session.id === activeSessionId),
     [sessions, activeSessionId],
   )
+  const activeResearchMessage = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].researchMode) return messages[index]
+    }
+    return null
+  }, [messages])
 
   return (
     <div className="workspace">
@@ -555,19 +564,24 @@ export function WorkspacePage() {
           </div>
         </footer>
       </main>
+      {activeResearchMessage && (
+        <DeepResearchWorkspace
+          events={activeResearchMessage.researchEvents ?? []}
+          graph={activeResearchMessage.researchGraph ?? null}
+          charts={activeResearchMessage.researchCharts ?? []}
+          report={activeResearchMessage.researchReport ?? ''}
+          sections={activeResearchMessage.researchSections ?? []}
+          references={activeResearchMessage.researchReferences ?? []}
+          streaming={Boolean(activeResearchMessage.streaming)}
+          open={researchWorkspaceOpen}
+          onToggleOpen={() => setResearchWorkspaceOpen((current) => !current)}
+        />
+      )}
     </div>
   )
 }
 
 function MessageBubble({ message }: { message: UiMessage }) {
-  const interactiveCharts = (message.researchCharts ?? []).filter(
-    (chart) => chart.echarts_option,
-  )
-  const reportCharts = (message.researchCharts ?? []).filter((chart) => chart.image_base64)
-  const hasReportPreview = Boolean(
-    message.researchReport?.trim() || message.researchSections?.length,
-  )
-
   if (message.role === 'user') {
     return (
       <div className="msg-row user-row">
@@ -581,32 +595,27 @@ function MessageBubble({ message }: { message: UiMessage }) {
         <Bot size={15} />
       </div>
       <div className="assistant-body">
-        <div className="assistant-text">
-          {message.content || (message.streaming ? '正在生成回答…' : '')}
-          {message.streaming && <span className="cursor" />}
-        </div>
-        {message.researchMode && (
-          <div className="research-output">
-            <ResearchEventPanel events={message.researchEvents ?? []} />
-            {message.researchGraph && <KnowledgeGraphView graph={message.researchGraph} />}
-            {!!interactiveCharts.length && (
-              <Suspense fallback={<div className="empty-note">图表加载中…</div>}>
-                <EChartsView charts={interactiveCharts} />
-              </Suspense>
-            )}
-            {!!reportCharts.length && <ReportChartsView charts={reportCharts} />}
-            {hasReportPreview && (
-              <ResearchReportView
-                report={message.researchReport ?? ''}
-                sections={message.researchSections ?? []}
-                references={message.researchReferences ?? []}
-              />
-            )}
+        {isFinalResearchReport(message) ? (
+          <div className="assistant-report-result">
+            <MarkdownPreview content={message.content} />
+          </div>
+        ) : (
+          <div className="assistant-text">
+            {message.content || (message.streaming ? '正在生成回答…' : '')}
+            {message.streaming && <span className="cursor" />}
           </div>
         )}
         {!!message.references?.length && <ReferenceList references={message.references} />}
       </div>
     </div>
+  )
+}
+
+function isFinalResearchReport(message: UiMessage): boolean {
+  return Boolean(
+    message.researchMode &&
+      !message.streaming &&
+      message.content.trim().startsWith('## '),
   )
 }
 
@@ -683,6 +692,7 @@ function normalizeKnowledgeGraph(graph: Record<string, unknown>): KnowledgeGraph
       .map((node) => ({
         id: String(node.id),
         label: typeof node.label === 'string' ? node.label : undefined,
+        display_label: typeof node.display_label === 'string' ? node.display_label : undefined,
         name: typeof node.name === 'string' ? node.name : undefined,
         type: typeof node.type === 'string' ? node.type : undefined,
         importance: typeof node.importance === 'number' ? node.importance : undefined,
@@ -757,10 +767,10 @@ function getEventSection(event: DeepResearchEvent): ResearchReportSection | null
 function getEventReport(event: DeepResearchEvent): string | null {
   const content = asRecord(event.content)
   if (event.type === 'report_draft' && typeof content.content === 'string') {
-    return content.content
+    return normalizeReportText(content.content)
   }
   if (event.type === 'done' && typeof content.final_report === 'string') {
-    return content.final_report
+    return normalizeReportText(content.final_report)
   }
   return null
 }
@@ -788,9 +798,9 @@ function getResumeUiState(event: DeepResearchEvent): {
   if (!Object.keys(uiState).length) return null
   const report =
     typeof uiState.final_report === 'string'
-      ? uiState.final_report
+      ? normalizeReportText(uiState.final_report)
       : typeof uiState.streaming_report === 'string'
-        ? uiState.streaming_report
+        ? normalizeReportText(uiState.streaming_report)
         : undefined
   return {
     graph: normalizeKnowledgeGraph(asRecord(uiState.knowledge_graph)),
@@ -872,4 +882,37 @@ function asOptionalRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object'
     ? (value as Record<string, unknown>)
     : undefined
+}
+
+function normalizeReportText(value: string): string {
+  const text = value.trim().replace(/\\n/g, '\n')
+  if (!text) return ''
+  const dictReport = extractDictStyleReport(text)
+  if (dictReport) return dictReport
+  return text
+}
+
+function extractDictStyleReport(text: string): string {
+  if (!text.startsWith('{') || !text.includes('内容')) return ''
+  const sections: Array<{ title: string; content: string }> = []
+  const pattern =
+    /['"]([^'"]+)['"]\s*:\s*\{\s*['"]内容['"]\s*:\s*['"]([\s\S]*?)['"]\s*(?:[,}])/g
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(text)) !== null) {
+    const title = match[1].replace(/^#+\s*/, '').trim()
+    const content = match[2].replace(/\\n/g, '\n').trim()
+    if (title && content) {
+      sections.push({ title, content })
+    }
+  }
+  if (!sections.length) return ''
+  return [
+    '## 执行摘要',
+    '本报告整理 Deep Research 已生成的章节内容，用于金融信息解释、经营分析和风险识别，不构成投资建议。',
+    ...sections.flatMap((section) => [`## ${section.title}`, section.content]),
+    '## 风险与限制',
+    '本报告依赖当前检索和本地资料，可能受到来源覆盖、数据时点和统计口径限制。',
+    '## 结论与展望',
+    '后续应持续跟踪公司公告、监管政策、行业经营指标和竞争格局变化。',
+  ].join('\n\n')
 }

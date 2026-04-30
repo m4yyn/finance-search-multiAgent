@@ -1,3 +1,4 @@
+import ast
 import json
 import re
 import uuid
@@ -199,7 +200,11 @@ class Writer(BaseAgent):
             await self.write_section(state, section)
 
         await self.synthesize_report(state)
-        state["final_report"] = self._sanitize_investment_advice(state.get("final_report", ""))
+        state["final_report"] = self._validated_report_or_fallback(
+            state.get("final_report", ""),
+            state,
+            "Writer final report failed validation after synthesis",
+        )
         state["phase"] = ResearchPhase.REVIEWING.value
 
         completed_at = datetime.now(timezone.utc)
@@ -291,7 +296,9 @@ class Writer(BaseAgent):
             )
             result = {}
 
-        section_content = str(result.get("content") or "").strip()
+        section_content = self._extract_text_payload(
+            result.get("content") if isinstance(result, dict) else ""
+        )
         if not section_content:
             section_content = self._fallback_section_content(section, related_facts, related_data_points)
         section_content = self._sanitize_investment_advice(section_content)
@@ -347,12 +354,16 @@ class Writer(BaseAgent):
             result = {}
 
         if isinstance(result, dict) and result.get("full_report"):
-            state["final_report"] = self._sanitize_investment_advice(str(result["full_report"]))
             self._merge_references(state, result.get("references", []))
+            state["final_report"] = self._validated_report_or_fallback(
+                result["full_report"],
+                state,
+                "Writer synthesis returned an incomplete report",
+            )
             executive_summary = str(result.get("executive_summary") or "")
             conclusions = result.get("conclusions", [])
         else:
-            state["final_report"] = self._fallback_report(state)
+            state["final_report"] = self._sanitize_report_content(self._fallback_report(state), state)
             executive_summary = ""
             conclusions = []
 
@@ -413,9 +424,17 @@ class Writer(BaseAgent):
             result = {}
 
         if isinstance(result, dict) and result.get("revised_content"):
-            state["final_report"] = self._sanitize_investment_advice(
-                str(result["revised_content"])
-            )
+            if state.get("draft_sections"):
+                state["final_report"] = self._validated_report_or_fallback(
+                    result["revised_content"],
+                    state,
+                    "Writer revision returned an incomplete report",
+                )
+            else:
+                state["final_report"] = self._sanitize_report_content(
+                    result["revised_content"],
+                    state,
+                )
             addressed = {str(item) for item in result.get("addressed_issues", [])}
             for feedback in state.get("critic_feedback", []):
                 if str(feedback.get("id")) in addressed:
@@ -651,6 +670,265 @@ class Writer(BaseAgent):
             sanitized = re.sub(pattern, "审慎关注", sanitized, flags=re.IGNORECASE)
         sanitized = re.sub(r"目标价格\s*[:：]?\s*[\d.]+元?", "估值敏感性需审慎评估", sanitized)
         return sanitized
+
+    def _sanitize_report_content(self, raw_content: Any, state: ResearchState) -> str:
+        content = self._extract_text_payload(raw_content)
+        if self._looks_like_raw_mapping(content):
+            content = self._fallback_report(state)
+        content = self._ensure_report_structure(content, state)
+        content = self._strip_raw_json_artifacts(content)
+        return self._sanitize_investment_advice(content).strip()
+
+    def _validated_report_or_fallback(
+        self,
+        raw_content: Any,
+        state: ResearchState,
+        error_context: str,
+    ) -> str:
+        candidate = self._sanitize_report_content(raw_content, state)
+        if self._is_report_complete(candidate, state):
+            return candidate
+
+        missing_titles = self._missing_outline_titles(candidate, state)
+        reasons: list[str] = []
+        if missing_titles:
+            reasons.append(f"missing_sections={','.join(missing_titles)}")
+        if self._has_machine_generated_headings(candidate):
+            reasons.append("machine_generated_headings")
+        if self._has_duplicate_required_sections(candidate):
+            reasons.append("duplicate_required_sections")
+        if not reasons:
+            reasons.append("invalid_report_structure")
+        state.setdefault("errors", []).append(
+            f"{error_context}; {'; '.join(reasons)}; rebuilt from draft sections."
+        )
+        return self._sanitize_report_content(self._fallback_report(state), state)
+
+    def _extract_text_payload(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, dict):
+            for key in (
+                "full_report",
+                "revised_content",
+                "content",
+                "正文",
+                "报告",
+                "内容",
+            ):
+                if key in value:
+                    extracted = self._extract_text_payload(value[key])
+                    if extracted:
+                        return extracted
+            sections = []
+            for key, item in value.items():
+                text = self._extract_text_payload(item)
+                if text:
+                    sections.append(f"## {self._clean_heading(str(key))}\n\n{text}")
+            return "\n\n".join(sections)
+        if isinstance(value, list):
+            return "\n\n".join(
+                item for item in (self._extract_text_payload(item) for item in value) if item
+            )
+
+        text = str(value).strip()
+        if not text:
+            return ""
+        parsed = self._parse_possible_mapping(text)
+        if parsed is not None:
+            extracted = self._extract_text_payload(parsed)
+            if extracted:
+                return extracted
+        return text
+
+    def _parse_possible_mapping(self, text: str) -> Any | None:
+        stripped = text.strip()
+        if not (
+            (stripped.startswith("{") and stripped.endswith("}"))
+            or (stripped.startswith("[") and stripped.endswith("]"))
+        ):
+            return None
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+        try:
+            return ast.literal_eval(stripped)
+        except (SyntaxError, ValueError):
+            return None
+
+    def _ensure_report_structure(self, content: str, state: ResearchState) -> str:
+        content = self._normalize_markdown_spacing(content)
+        if not content:
+            return self._fallback_report(state)
+        if "## 执行摘要" in content:
+            return self._append_missing_required_sections(content, state)
+
+        references = "\n".join(self._collect_all_sources(state)[:30])
+        return (
+            "## 执行摘要\n\n"
+            f"本报告围绕“{state.get('query', '')}”整理已检索事实、结构化数据和图表，"
+            "用于金融信息解释、经营分析和风险识别，不构成投资建议。\n\n"
+            f"{content}\n\n"
+            "## 风险与限制\n\n"
+            "本报告依赖当前可用检索结果和本地资料，可能受到来源覆盖、数据时点、统计口径和披露完整性限制；"
+            "相关判断应随公司公告、监管政策和行业数据更新而调整。\n\n"
+            "## 结论与展望\n\n"
+            "后续应持续跟踪公司定期报告、监管政策、行业需求、竞争格局和关键财务指标变化。\n\n"
+            "## 参考文献\n\n"
+            f"{references or '暂无可用参考文献。'}"
+        )
+
+    def _append_missing_required_sections(self, content: str, state: ResearchState) -> str:
+        normalized_headings = {
+            self._normalize_heading_label(heading)
+            for heading in self._extract_markdown_headings(content)
+        }
+        additions: list[str] = []
+        if "风险与限制" not in normalized_headings:
+            additions.append(
+                "## 风险与限制\n\n"
+                "本报告依赖当前可用检索结果和本地资料，可能受到来源覆盖、数据时点、统计口径和披露完整性限制；"
+                "相关判断应随公司公告、监管政策和行业数据更新而调整。"
+            )
+        if "结论与展望" not in normalized_headings:
+            additions.append(
+                "## 结论与展望\n\n"
+                "后续应持续跟踪公司定期报告、监管政策、行业需求、竞争格局和关键财务指标变化。"
+            )
+        if "参考文献" not in normalized_headings:
+            references = "\n".join(self._collect_all_sources(state)[:30])
+            additions.append(f"## 参考文献\n\n{references or '暂无可用参考文献。'}")
+        if not additions:
+            return content
+        return f"{content.rstrip()}\n\n" + "\n\n".join(additions)
+
+    def _append_missing_reference_section(self, content: str, state: ResearchState) -> str:
+        if "## 参考文献" in content:
+            return content
+        references = "\n".join(self._collect_all_sources(state)[:30])
+        return f"{content.rstrip()}\n\n## 参考文献\n\n{references or '暂无可用参考文献。'}"
+
+    def _normalize_markdown_spacing(self, content: str) -> str:
+        content = content.replace("\\n", "\n")
+        content = re.sub(r"\r\n?", "\n", content)
+        content = re.sub(r"(?<!\n)(##\s+)", r"\n\n\1", content)
+        content = re.sub(r"\n{3,}", "\n\n", content)
+        return content.strip()
+
+    def _strip_raw_json_artifacts(self, content: str) -> str:
+        content = content.strip()
+        content = re.sub(r"^[\s{'\"]+|[\s}'\"]+$", "", content)
+        content = re.sub(r"['\"]?内容['\"]?\s*[:：]\s*", "", content)
+        content = re.sub(
+            r"['\"]?(full_report|executive_summary|conclusions|outlook)['\"]?\s*[:：]\s*",
+            "",
+            content,
+        )
+        content = content.replace("{", "").replace("}", "")
+        return self._normalize_markdown_spacing(content)
+
+    def _looks_like_raw_mapping(self, content: str) -> bool:
+        stripped = content.strip()
+        if not stripped:
+            return False
+        if stripped.startswith("{") or stripped.endswith("}"):
+            return True
+        mapping_tokens = len(
+            re.findall(r"['\"]?[\w\u4e00-\u9fff]+['\"]?\s*[:：]\s*[{'\"]", stripped)
+        )
+        return mapping_tokens >= 3
+
+    def _clean_heading(self, heading: str) -> str:
+        heading = heading.strip().strip("'\"{}[]")
+        heading = re.sub(r"^#+\s*", "", heading)
+        return heading or "未命名章节"
+
+    def _is_report_complete(self, content: str, state: ResearchState) -> bool:
+        if not content.strip():
+            return False
+        normalized_headings = {
+            self._normalize_heading_label(heading)
+            for heading in self._extract_markdown_headings(content)
+        }
+        required = {"执行摘要", "风险与限制", "结论与展望", "参考文献"}
+        if not required.issubset(normalized_headings):
+            return False
+        if self._has_machine_generated_headings(content):
+            return False
+        if self._has_duplicate_required_sections(content):
+            return False
+        return not self._missing_outline_titles(content, state)
+
+    def _missing_outline_titles(self, content: str, state: ResearchState) -> list[str]:
+        headings = {
+            self._normalize_heading_label(heading)
+            for heading in self._extract_markdown_headings(content)
+        }
+        expected = self._expected_outline_titles(state)
+        return [
+            title
+            for title in expected
+            if self._normalize_heading_label(title) not in headings
+        ]
+
+    def _expected_outline_titles(self, state: ResearchState) -> list[str]:
+        titles: list[str] = []
+        drafts = state.get("draft_sections", {})
+        for section in state.get("outline", []):
+            if not isinstance(section, dict):
+                continue
+            section_id = str(section.get("id") or "")
+            title = str(section.get("title") or "").strip()
+            if not title:
+                continue
+            if drafts and section_id and section_id not in drafts:
+                continue
+            titles.append(title)
+        return titles
+
+    def _has_machine_generated_headings(self, content: str) -> bool:
+        machine_names = {
+            "executive_summary",
+            "full_report",
+            "market_overview",
+            "competitive_landscape",
+            "technology_trends",
+            "policy_environment",
+            "challenges_opportunities",
+            "future_outlook",
+            "risk_limitations",
+            "conclusions",
+            "references",
+        }
+        for heading in self._extract_markdown_headings(content):
+            label = heading.strip().strip("#").strip().lower()
+            if label in machine_names:
+                return True
+            if re.match(r"^(?:\d+[_-])?[a-z][a-z0-9]+(?:[_-][a-z0-9]+)+$", label):
+                return True
+        return False
+
+    def _has_duplicate_required_sections(self, content: str) -> bool:
+        counts: dict[str, int] = {}
+        required = {"执行摘要", "风险与限制", "结论与展望", "参考文献"}
+        for heading in self._extract_markdown_headings(content):
+            label = self._normalize_heading_label(heading)
+            if label in required:
+                counts[label] = counts.get(label, 0) + 1
+        return any(count > 1 for count in counts.values())
+
+    def _extract_markdown_headings(self, content: str) -> list[str]:
+        return [
+            match.group(1).strip()
+            for match in re.finditer(r"^#{2,3}\s+(.+?)\s*$", content, flags=re.MULTILINE)
+        ]
+
+    def _normalize_heading_label(self, heading: str) -> str:
+        label = self._clean_heading(heading)
+        label = re.sub(r"^[0-9一二三四五六七八九十]+[\s.、_-]+", "", label)
+        label = re.sub(r"\s+", "", label)
+        return label.lower()
 
 
 LeadWriter = Writer

@@ -1,3 +1,4 @@
+import copy
 import json
 import uuid
 from datetime import datetime, timezone
@@ -111,7 +112,9 @@ CHART_GENERATION_PROMPT = """你是金融行业研究报告的数据可视化 Ag
 1. 只使用结构化数据中已有的数据，不要补造时间、数值或分类。
 2. 图表应服务于金融行业报告表达，例如趋势、结构占比、指标对比、风险分布。
 3. echarts_option 必须是合法 ECharts option object，包含 title、tooltip、legend 或坐标轴等必要配置。
-4. 如果数据不足，只输出空 charts 数组。
+4. 趋势图 line 至少需要 2 个时间点；结构图 pie 至少需要 2 个类别；指标对比 bar 的类目数量必须与 series data 数量一致。
+5. 标题或副标题必须体现单位、数据口径或来源；不要生成无法解释的单点折线、单值饼图或空白坐标系。
+6. 如果数据不足以形成完整图表，只输出空 charts 数组。
 
 输出严格 JSON object，不要 Markdown：
 {{
@@ -499,6 +502,7 @@ class DataAnalyst(BaseAgent):
         topic_node = {
             "id": "topic",
             "label": topic_label,
+            "display_label": self._truncate_label(str(topic_label)),
             "name": topic_label,
             "type": "topic",
             "importance": 10.0,
@@ -536,6 +540,7 @@ class DataAnalyst(BaseAgent):
             node = {
                 "id": node_id,
                 "label": label,
+                "display_label": self._truncate_label(label),
                 "name": label,
                 "type": str(raw_node.get("type") or "entity"),
                 "importance": importance,
@@ -545,6 +550,8 @@ class DataAnalyst(BaseAgent):
             nodes.append(node)
             seen_ids.add(node_id)
             id_by_label[label] = node_id
+            if len(nodes) >= 24:
+                break
 
         edges: list[dict[str, Any]] = []
         seen_edges: set[tuple[str, str, str]] = set()
@@ -570,6 +577,8 @@ class DataAnalyst(BaseAgent):
                 }
             )
             seen_edges.add(edge_key)
+            if len(edges) >= 40:
+                break
 
         return {"nodes": nodes, "edges": edges}
 
@@ -589,6 +598,14 @@ class DataAnalyst(BaseAgent):
             option = raw_chart.get("echarts_option") or raw_chart.get("option") or {}
             if not isinstance(option, dict):
                 option = {}
+            normalized_option = self._normalize_echarts_option(
+                option,
+                chart_type=chart_type,
+                title=title,
+                raw_data=raw_chart.get("data") if isinstance(raw_chart.get("data"), dict) else {},
+            )
+            if normalized_option is None:
+                continue
             charts.append(
                 {
                     "id": str(uuid.uuid4()),
@@ -598,7 +615,7 @@ class DataAnalyst(BaseAgent):
                     "type": chart_type,
                     "section_id": raw_chart.get("section_id"),
                     "data": raw_chart.get("data") if isinstance(raw_chart.get("data"), dict) else {},
-                    "echarts_option": option,
+                    "echarts_option": normalized_option,
                     "metadata": {
                         "insight": raw_chart.get("insight", ""),
                         "generated_by": self.name,
@@ -606,6 +623,114 @@ class DataAnalyst(BaseAgent):
                 }
             )
         return charts
+
+    def _normalize_echarts_option(
+        self,
+        option: dict[str, Any],
+        chart_type: str,
+        title: str,
+        raw_data: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        normalized = copy.deepcopy(option)
+        chart_type = chart_type.lower().strip()
+        if chart_type in {"table", "kpi"}:
+            return None
+        series = normalized.get("series")
+        if isinstance(series, dict):
+            series = [series]
+        if not isinstance(series, list) or not series:
+            return None
+        series = [item for item in series if isinstance(item, dict)]
+        if not series:
+            return None
+
+        categories = self._category_axis_data(normalized)
+        labels = raw_data.get("labels") or raw_data.get("categories") or raw_data.get("years")
+        values = raw_data.get("values") or raw_data.get("value") or raw_data.get("growth_rate")
+        if not isinstance(labels, list):
+            labels = []
+        if not isinstance(values, list):
+            values = []
+
+        if chart_type == "line":
+            valid_series = [
+                item
+                for item in series
+                if isinstance(item.get("data"), list) and len(item["data"]) >= 2
+            ]
+            if not valid_series:
+                return None
+            series = valid_series
+
+        if chart_type == "pie":
+            data = series[0].get("data")
+            if isinstance(data, list) and len(data) >= 2:
+                pass
+            elif len(labels) >= 2 and len(values) >= 2:
+                series[0]["data"] = [
+                    {"name": str(label), "value": value}
+                    for label, value in zip(labels, values, strict=False)
+                ]
+            else:
+                return None
+
+        if chart_type == "bar":
+            if categories and len(series) > 1 and all(
+                isinstance(item.get("data"), list) and len(item["data"]) == 1
+                for item in series
+            ):
+                series = [
+                    {
+                        "type": "bar",
+                        "name": title,
+                        "data": [item["data"][0] for item in series],
+                    }
+                ]
+            if categories:
+                fixed_series: list[dict[str, Any]] = []
+                for item in series:
+                    data = item.get("data")
+                    if isinstance(data, list) and len(data) == len(categories):
+                        fixed_series.append(item)
+                    elif len(values) == len(categories):
+                        fixed_series.append({**item, "data": values})
+                if not fixed_series:
+                    return None
+                series = fixed_series
+
+        normalized["series"] = series
+        normalized.setdefault("title", {"text": title})
+        normalized.setdefault("tooltip", {"trigger": "axis" if chart_type != "pie" else "item"})
+        if chart_type != "pie":
+            normalized.setdefault("grid", {})
+            if isinstance(normalized["grid"], dict):
+                normalized["grid"] = {
+                    "left": normalized["grid"].get("left", 48),
+                    "right": normalized["grid"].get("right", 24),
+                    "top": normalized["grid"].get("top", 64),
+                    "bottom": normalized["grid"].get("bottom", 48),
+                    "containLabel": True,
+                }
+            normalized.setdefault("xAxis", {"type": "category", "data": categories})
+            normalized.setdefault("yAxis", {"type": "value"})
+        if len(series) > 1 or chart_type == "pie":
+            normalized.setdefault("legend", {"bottom": 0})
+        elif chart_type != "pie":
+            normalized.pop("legend", None)
+        return normalized
+
+    def _category_axis_data(self, option: dict[str, Any]) -> list[Any]:
+        for axis_name in ("xAxis", "yAxis"):
+            axis = option.get(axis_name)
+            axis_items = axis if isinstance(axis, list) else [axis]
+            for axis_item in axis_items:
+                if (
+                    isinstance(axis_item, dict)
+                    and axis_item.get("type") == "category"
+                    and isinstance(axis_item.get("data"), list)
+                ):
+                    return axis_item["data"]
+        return []
 
     def _format_facts_for_prompt(
         self,
@@ -655,6 +780,9 @@ class DataAnalyst(BaseAgent):
         if safe:
             return safe[:64]
         return f"node_{uuid.uuid5(uuid.NAMESPACE_URL, label).hex[:12]}"
+
+    def _truncate_label(self, label: str, max_length: int = 12) -> str:
+        return label if len(label) <= max_length else f"{label[:max_length]}…"
 
     def _resolve_node_ref(
         self,

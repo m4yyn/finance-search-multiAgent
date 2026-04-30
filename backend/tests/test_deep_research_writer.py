@@ -213,6 +213,111 @@ def test_writer_synthesis_fallback_uses_draft_sections() -> None:
     run(run_check())
 
 
+def test_writer_sanitizes_stringified_dict_report_into_markdown_sections() -> None:
+    async def run_check() -> None:
+        state = writer_state()
+        agent = StubWriter(
+            [
+                section_payload("市场概况"),
+                section_payload("风险因素"),
+                {
+                    "executive_summary": "摘要",
+                    "full_report": (
+                        "{'1 市场概况': {'内容': '银行业规模保持增长。'}, "
+                        "'2 风险因素': {'内容': '净息差和资产质量仍需跟踪。'}}"
+                    ),
+                    "references": [],
+                },
+            ]
+        )
+
+        result = await agent.process(state)
+
+        assert result["final_report"].startswith("## 执行摘要")
+        assert "## 1 市场概况" in result["final_report"]
+        assert "银行业规模保持增长。" in result["final_report"]
+        assert "## 风险与限制" in result["final_report"]
+        assert "{" not in result["final_report"]
+        assert "}" not in result["final_report"]
+        assert "'内容'" not in result["final_report"]
+
+    run(run_check())
+
+
+def test_writer_rebuilds_report_when_synthesis_drops_sections_and_uses_machine_keys() -> None:
+    async def run_check() -> None:
+        state = writer_state()
+        state["outline"].extend(
+            [
+                {
+                    "id": "sec_3",
+                    "title": "技术趋势",
+                    "description": "分析金融科技与数字化趋势。",
+                    "section_type": "mixed",
+                    "status": "researching",
+                },
+                {
+                    "id": "sec_4",
+                    "title": "政策环境",
+                    "description": "分析监管政策影响。",
+                    "section_type": "mixed",
+                    "status": "researching",
+                },
+                {
+                    "id": "sec_5",
+                    "title": "挑战机遇",
+                    "description": "分析风险和机会。",
+                    "section_type": "mixed",
+                    "status": "researching",
+                },
+                {
+                    "id": "sec_6",
+                    "title": "未来展望",
+                    "description": "分析未来经营趋势。",
+                    "section_type": "mixed",
+                    "status": "researching",
+                },
+            ]
+        )
+        bad_synthesis = {
+            "executive_summary": "摘要",
+            "full_report": (
+                "## 执行摘要\n\n摘要。\n\n"
+                "## executive_summary\n\n机器字段不应进入正文。\n\n"
+                "## 1_market_overview\n\n只保留了第一节。\n\n"
+                "## 6_future_outlook\n\n只保留了第六节。\n\n"
+                "## 风险与限制\n\n风险说明。\n\n"
+                "## 参考文献\n\n1. 来源。\n\n"
+                "## 风险与限制\n\n重复风险说明。"
+            ),
+            "references": [],
+        }
+        agent = StubWriter(
+            [
+                section_payload("市场概况"),
+                section_payload("风险因素"),
+                section_payload("技术趋势"),
+                section_payload("政策环境"),
+                section_payload("挑战机遇"),
+                section_payload("未来展望"),
+                bad_synthesis,
+            ]
+        )
+
+        result = await agent.process(state)
+
+        for title in ["市场概况", "风险因素", "技术趋势", "政策环境", "挑战机遇", "未来展望"]:
+            assert title in result["final_report"]
+        assert "executive_summary" not in result["final_report"]
+        assert "1_market_overview" not in result["final_report"]
+        assert "6_future_outlook" not in result["final_report"]
+        assert result["final_report"].count("## 风险与限制") == 1
+        assert result["final_report"].count("## 参考文献") == 1
+        assert any("missing_sections" in error for error in result["errors"])
+
+    run(run_check())
+
+
 def test_writer_revision_marks_feedback_resolved() -> None:
     async def run_check() -> None:
         state = writer_state()

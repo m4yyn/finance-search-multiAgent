@@ -145,9 +145,9 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
-test('WorkspacePage streams Deep Research events and renders graph and charts', async () => {
+test('WorkspacePage streams Deep Research events into side workspace and returns final report in chat', async () => {
   const user = userEvent.setup()
-  render(<WorkspacePage />)
+  const { container } = render(<WorkspacePage />)
 
   await user.click(screen.getByRole('button', { name: 'Deep Research' }))
   await user.type(
@@ -165,17 +165,23 @@ test('WorkspacePage streams Deep Research events and renders graph and charts', 
     search_web: true,
     search_local: false,
   })
-  expect(screen.getByText(/Deep Research 已完成/)).toBeVisible()
-  expect(screen.getByText(/1 个可用于报告/)).toBeVisible()
-  expect(screen.getAllByText(/报告 62 字符，引用 1 个来源/)[0]).toBeVisible()
+  expect(screen.getByText(/银行业报告已生成/)).toBeVisible()
   expect(screen.getAllByText(/质量分 8.6\/10/)[0]).toBeVisible()
   expect(screen.getByText('Agent Timeline')).toBeVisible()
+  expect(screen.getByText('报告审核完成')).toBeVisible()
+  expect(container.querySelector('.assistant-report-result')?.textContent).toContain('执行摘要')
+  expect(container.querySelector('.assistant-report-result')?.textContent).not.toContain('Agent Timeline')
+
+  await user.click(screen.getByRole('button', { name: /图谱/ }))
   expect(screen.getByText('银行业')).toBeVisible()
+
+  await user.click(screen.getByRole('button', { name: /图表/ }))
   expect(await screen.findByText('资产规模')).toBeVisible()
   expect(screen.getByRole('img', { name: '净息差趋势报告图' })).toBeVisible()
+
+  await user.click(screen.getByRole('button', { name: /报告/ }))
   expect(screen.getByText('Report Draft')).toBeVisible()
-  expect(screen.getByText('报告审核完成')).toBeVisible()
-  expect(screen.getByText('执行摘要')).toBeVisible()
+  expect(screen.getAllByText('执行摘要')[0]).toBeVisible()
   expect(screen.getAllByRole('link', { name: '测试来源' })[0]).toHaveAttribute(
     'href',
     'https://example.com',
@@ -203,7 +209,7 @@ test('WorkspacePage restores Deep Research UI state from resume event', async ()
             },
           ],
           streaming_report:
-            '## 执行摘要\n\n恢复的报告内容，引用[恢复来源](https://example.com/resume)。',
+            "{'1 市场概况': {'内容': '恢复的报告内容，引用[恢复来源](https://example.com/resume)。'}}",
           references: [
             {
               id: 1,
@@ -246,8 +252,11 @@ test('WorkspacePage restores Deep Research UI state from resume event', async ()
   await user.click(screen.getByRole('button', { name: '发送' }))
 
   expect(await screen.findByText('研究状态已恢复')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: /图谱/ }))
   expect(screen.getByText('恢复银行业')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: /图表/ }))
   expect(await screen.findByText('恢复图表')).toBeVisible()
+  await user.click(screen.getByRole('button', { name: /报告/ }))
   expect(screen.getByText('Report Draft')).toBeVisible()
   expect(screen.getAllByRole('link', { name: '恢复来源' })[0]).toHaveAttribute(
     'href',

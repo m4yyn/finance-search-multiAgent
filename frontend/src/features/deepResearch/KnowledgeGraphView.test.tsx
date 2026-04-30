@@ -1,8 +1,25 @@
 import { render, screen } from '@testing-library/react'
+import * as echarts from 'echarts/core'
 import { KnowledgeGraphView } from './KnowledgeGraphView'
 import type { KnowledgeGraphPayload } from '../../types'
 
-test('KnowledgeGraphView renders nodes and relation labels', () => {
+const setOptionMock = vi.fn()
+const disposeMock = vi.fn()
+
+vi.mock('echarts/core', () => ({
+  init: vi.fn(() => ({
+    setOption: setOptionMock,
+    dispose: disposeMock,
+    resize: vi.fn(),
+  })),
+  use: vi.fn(),
+}))
+
+afterEach(() => {
+  vi.clearAllMocks()
+})
+
+test('KnowledgeGraphView renders graph canvas and node strip', () => {
   const graph: KnowledgeGraphPayload = {
     nodes: [
       { id: 'topic', label: '银行业', type: 'topic', size: 50 },
@@ -16,5 +33,16 @@ test('KnowledgeGraphView renders nodes and relation labels', () => {
   expect(screen.getByLabelText('Deep Research 知识图谱')).toBeVisible()
   expect(screen.getByText('银行业')).toBeVisible()
   expect(screen.getByText('净息差')).toBeVisible()
-  expect(screen.getByText('constrains')).toBeVisible()
+  expect(echarts.init).toHaveBeenCalledTimes(1)
+  expect(setOptionMock).toHaveBeenCalledWith(
+    expect.objectContaining({
+      series: [
+        expect.objectContaining({
+          type: 'graph',
+          layout: 'force',
+        }),
+      ],
+    }),
+    true,
+  )
 })

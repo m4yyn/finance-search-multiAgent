@@ -279,6 +279,90 @@ def test_data_analyst_process_soft_fails_on_unexpected_error() -> None:
     run(run_check())
 
 
+def test_data_analyst_repairs_or_skips_incomplete_chart_options() -> None:
+    agent = StubDataAnalyst([])
+
+    charts = agent._normalize_charts(  # noqa: SLF001
+        {
+            "charts": [
+                {
+                    "title": "指标对比",
+                    "chart_type": "bar",
+                    "data": {"categories": ["营收", "利润"], "values": [100, 20]},
+                    "echarts_option": {
+                        "xAxis": {"type": "category", "data": ["营收", "利润"]},
+                        "yAxis": {"type": "value"},
+                        "series": [
+                            {"type": "bar", "name": "营收", "data": [100]},
+                            {"type": "bar", "name": "利润", "data": [20]},
+                        ],
+                    },
+                },
+                {
+                    "title": "单点趋势",
+                    "chart_type": "line",
+                    "echarts_option": {
+                        "xAxis": {"type": "category", "data": ["2024"]},
+                        "series": [{"type": "line", "data": [7.0]}],
+                    },
+                },
+                {
+                    "title": "单值占比",
+                    "chart_type": "pie",
+                    "echarts_option": {
+                        "series": [{"type": "pie", "data": [{"name": "市场", "value": 10}]}],
+                    },
+                },
+            ]
+        }
+    )
+
+    assert len(charts) == 1
+    option = charts[0]["echarts_option"]
+    assert len(option["series"]) == 1
+    assert option["series"][0]["data"] == [100, 20]
+    assert option["grid"]["containLabel"] is True
+
+
+def test_data_analyst_normalizes_graph_for_ui() -> None:
+    state = analysis_state()
+    agent = StubDataAnalyst([])
+
+    graph = agent._normalize_knowledge_graph(  # noqa: SLF001
+        {
+            "nodes": [
+                {
+                    "id": "company",
+                    "label": "一个非常非常长的公司或行业节点名称",
+                    "type": "company",
+                    "importance": 8,
+                },
+                {"id": "company", "label": "重复节点", "type": "company"},
+            ],
+            "edges": [
+                {"source": "topic", "target": "company", "type": "supports"},
+                {"source": "topic", "target": "company", "type": "supports"},
+                {"source": "company", "target": "company", "type": "self"},
+                {"source": "missing", "target": "company", "type": "bad"},
+            ],
+        },
+        state,
+    )
+
+    assert [node["id"] for node in graph["nodes"]] == ["topic", "company"]
+    assert graph["nodes"][1]["display_label"].endswith("…")
+    assert graph["edges"] == [
+        {
+            "source": "topic",
+            "target": "company",
+            "type": "supports",
+            "relation": "supports",
+            "weight": 3.0,
+            "description": "",
+        }
+    ]
+
+
 def test_data_analyst_pushes_events_to_queue() -> None:
     async def run_check() -> None:
         state = analysis_state()

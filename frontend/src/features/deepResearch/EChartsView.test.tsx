@@ -38,8 +38,35 @@ test('EChartsView initializes and disposes chart instances', () => {
 
   expect(screen.getByText('资产规模')).toBeVisible()
   expect(echarts.init).toHaveBeenCalledTimes(1)
-  expect(setOptionMock).toHaveBeenCalledWith(charts[0].echarts_option, true)
+  expect(setOptionMock).toHaveBeenCalledWith(
+    expect.objectContaining({
+      title: expect.objectContaining({ text: '资产规模' }),
+      grid: expect.objectContaining({ containLabel: true }),
+    }),
+    true,
+  )
 
   unmount()
   expect(disposeMock).toHaveBeenCalledTimes(1)
+})
+
+test('EChartsView shows fallback for incomplete chart options', () => {
+  const charts: ResearchChart[] = [
+    {
+      id: 'chart-1',
+      title: '单点趋势',
+      chart_type: 'line',
+      echarts_option: {
+        title: { text: '单点趋势' },
+        xAxis: { type: 'category', data: ['2024'] },
+        series: [{ type: 'line', data: [7] }],
+      },
+    },
+  ]
+
+  render(<EChartsView charts={charts} />)
+
+  expect(screen.getByText('单点趋势')).toBeVisible()
+  expect(screen.getByText('当前图表数据点不足，已跳过不完整渲染。')).toBeVisible()
+  expect(echarts.init).not.toHaveBeenCalled()
 })
