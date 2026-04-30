@@ -10,9 +10,14 @@ import {
   Sparkles,
   Trash2,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as chatApi from '../../api/chat'
+import * as deepResearchApi from '../../api/deepResearch'
 import * as knowledgeApi from '../../api/knowledge'
+import { KnowledgeGraphView } from '../deepResearch/KnowledgeGraphView'
+import { ReportChartsView } from '../deepResearch/ReportChartsView'
+import { ResearchEventPanel } from '../deepResearch/ResearchEventPanel'
+import { ResearchReportView } from '../deepResearch/ResearchReportView'
 import { useAuth } from '../auth/AuthProvider'
 import { KnowledgePanel } from '../knowledge/KnowledgePanel'
 import { toSearchMode, toggleSearchMode, type SearchToggle } from './searchMode'
@@ -20,8 +25,13 @@ import type {
   ChatMessage,
   ChatReference,
   ChatSession,
+  DeepResearchEvent,
   DocumentRecord,
+  KnowledgeGraphPayload,
   KnowledgeBase,
+  ResearchChart,
+  ResearchReportReference,
+  ResearchReportSection,
 } from '../../types'
 
 interface UiMessage {
@@ -29,6 +39,13 @@ interface UiMessage {
   role: 'user' | 'assistant'
   content: string
   references?: ChatReference[]
+  researchMode?: boolean
+  researchEvents?: DeepResearchEvent[]
+  researchGraph?: KnowledgeGraphPayload | null
+  researchCharts?: ResearchChart[]
+  researchReport?: string
+  researchSections?: ResearchReportSection[]
+  researchReferences?: ResearchReportReference[]
   streaming?: boolean
 }
 
@@ -39,6 +56,12 @@ const SAMPLE_PROMPTS = [
   '帮我设计一份上市公司年报分析框架',
 ]
 
+const EChartsView = lazy(() =>
+  import('../deepResearch/EChartsView').then((module) => ({
+    default: module.EChartsView,
+  })),
+)
+
 export function WorkspacePage() {
   const { user, logout } = useAuth()
   const [sidebarTab, setSidebarTab] = useState<'chat' | 'files'>('chat')
@@ -47,6 +70,7 @@ export function WorkspacePage() {
   const [messages, setMessages] = useState<UiMessage[]>([])
   const [input, setInput] = useState('')
   const [searchToggle, setSearchToggle] = useState<SearchToggle>(null)
+  const [deepResearchMode, setDeepResearchMode] = useState(false)
   const [streaming, setStreaming] = useState(false)
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null)
   const [error, setError] = useState('')
@@ -105,7 +129,8 @@ export function WorkspacePage() {
   }, [activeSessionId])
 
   useEffect(() => {
-    messagesRef.current?.scrollTo({
+    if (!messagesRef.current?.scrollTo) return
+    messagesRef.current.scrollTo({
       top: messagesRef.current.scrollHeight,
       behavior: 'smooth',
     })
@@ -182,57 +207,163 @@ export function WorkspacePage() {
       setMessages((current) => [
         ...current,
         userMessage,
-        { id: assistantId, role: 'assistant', content: '', streaming: true },
+        {
+          id: assistantId,
+          role: 'assistant',
+          content: deepResearchMode ? 'Deep Research 正在执行…' : '',
+          streaming: true,
+          researchMode: deepResearchMode,
+          researchEvents: deepResearchMode ? [] : undefined,
+          researchGraph: deepResearchMode ? null : undefined,
+          researchCharts: deepResearchMode ? [] : undefined,
+          researchReport: deepResearchMode ? '' : undefined,
+          researchSections: deepResearchMode ? [] : undefined,
+          researchReferences: deepResearchMode ? [] : undefined,
+        },
       ])
 
-      await chatApi.streamChatMessage(
-        {
-          session_id: sessionId,
-          content,
-          search_mode: searchMode,
-        },
-        (event) => {
-          if (event.type === 'delta' && event.delta) {
-            setMessages((current) =>
-              current.map((message) =>
-                message.id === assistantId
-                  ? { ...message, content: message.content + event.delta }
-                  : message,
-              ),
-            )
-          }
-          if (event.type === 'done') {
-            setMessages((current) =>
-              current.map((message) =>
-                message.id === assistantId
-                  ? {
-                      ...message,
-                      id: event.message_id ?? message.id,
-                      streaming: false,
-                      references: event.references ?? [],
-                    }
-                  : message,
-              ),
-            )
-          }
-          if (event.type === 'error') {
-            throw new Error(event.error || '流式回答失败')
-          }
-        },
-      )
+      if (deepResearchMode) {
+        await streamDeepResearchMessage(sessionId, content, assistantId)
+      } else {
+        await chatApi.streamChatMessage(
+          {
+            session_id: sessionId,
+            content,
+            search_mode: searchMode,
+          },
+          (event) => {
+            if (event.type === 'delta' && event.delta) {
+              setMessages((current) =>
+                current.map((message) =>
+                  message.id === assistantId
+                    ? { ...message, content: message.content + event.delta }
+                    : message,
+                ),
+              )
+            }
+            if (event.type === 'done') {
+              setMessages((current) =>
+                current.map((message) =>
+                  message.id === assistantId
+                    ? {
+                        ...message,
+                        id: event.message_id ?? message.id,
+                        streaming: false,
+                        references: event.references ?? [],
+                      }
+                    : message,
+                ),
+              )
+            }
+            if (event.type === 'error') {
+              throw new Error(event.error || '流式回答失败')
+            }
+          },
+        )
+      }
       await refreshSessions()
     } catch (err) {
       setError(err instanceof Error ? err.message : '发送失败')
       setMessages((current) =>
         current.map((message) =>
           message.streaming
-            ? { ...message, streaming: false, content: message.content || '回答生成失败。' }
+            ? {
+                ...message,
+                streaming: false,
+                content: message.content || '回答生成失败。',
+              }
             : message,
         ),
       )
     } finally {
       setStreaming(false)
     }
+  }
+
+  async function streamDeepResearchMessage(
+    sessionId: string,
+    content: string,
+    assistantId: string,
+  ) {
+    const searchFlags = getDeepResearchSearchFlags(searchToggle)
+    await deepResearchApi.streamDeepResearch(
+      {
+        session_id: sessionId,
+        content,
+        search_web: searchFlags.search_web,
+        search_local: searchFlags.search_local,
+      },
+      (event) => {
+        appendResearchEvent(assistantId, event)
+        if (event.type === 'done') {
+          const summary = asRecord(asRecord(event.content).summary)
+          const chartsCount = Number(summary.charts_count ?? 0)
+          const reportChartsCount = Number(summary.report_charts_count ?? 0)
+          const factsCount = Number(summary.facts_count ?? 0)
+          const referencesCount = Number(summary.references_count ?? 0)
+          const reportWordCount = Number(summary.report_word_count ?? 0)
+          const hasQualityScore = summary.quality_score !== undefined && summary.quality_score !== null
+          const qualityScore = hasQualityScore ? Number(summary.quality_score) : null
+          const unresolvedIssues = Number(summary.unresolved_issues ?? 0)
+          const reportChartText = reportChartsCount
+            ? `，其中 ${reportChartsCount} 个可用于报告`
+            : ''
+          const reportText = reportWordCount
+            ? `，报告 ${reportWordCount} 字符，引用 ${referencesCount} 个来源`
+            : ''
+          const reviewText =
+            qualityScore !== null && Number.isFinite(qualityScore) ? `，质量分 ${qualityScore}/10` : ''
+          const issueText = unresolvedIssues ? `，未解决问题 ${unresolvedIssues} 个` : ''
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === assistantId
+                ? {
+                    ...message,
+                    streaming: false,
+                    content: `Deep Research 已完成：沉淀 ${factsCount} 条事实，生成 ${chartsCount} 个图表${reportChartText}${reportText}${reviewText}${issueText}。`,
+                  }
+                : message,
+            ),
+          )
+        }
+        if (event.type === 'error') {
+          throw new Error(event.error || 'Deep Research 执行失败')
+        }
+      },
+    )
+  }
+
+  function appendResearchEvent(assistantId: string, event: DeepResearchEvent) {
+    setMessages((current) =>
+      current.map((message) => {
+        if (message.id !== assistantId) return message
+        const nextEvents = [...(message.researchEvents ?? []), event]
+        const resumeState = getResumeUiState(event)
+        const nextGraph = resumeState?.graph ?? getEventKnowledgeGraph(event) ?? message.researchGraph ?? null
+        const eventCharts = resumeState?.charts ?? getEventCharts(event)
+        const eventSection = getEventSection(event)
+        const eventReport = resumeState?.report ?? getEventReport(event)
+        const eventReferences = resumeState?.references ?? getEventReferences(event)
+        const nextCharts = eventCharts
+          ? mergeResearchCharts(message.researchCharts ?? [], eventCharts)
+          : message.researchCharts ?? []
+        const nextSections = eventSection
+          ? mergeResearchSections(message.researchSections ?? [], [eventSection])
+          : message.researchSections ?? []
+        const nextReferences = eventReferences
+          ? mergeResearchReferences(message.researchReferences ?? [], eventReferences)
+          : message.researchReferences ?? []
+        return {
+          ...message,
+          researchEvents: nextEvents,
+          researchGraph: nextGraph,
+          researchCharts: nextCharts,
+          researchReport: eventReport ?? message.researchReport ?? '',
+          researchSections: nextSections,
+          researchReferences: nextReferences,
+        }
+      }),
+    )
   }
 
   const activeSession = useMemo(
@@ -341,6 +472,7 @@ export function WorkspacePage() {
                 {searchToggle === 'web' ? '网络搜索' : '本地搜索'}
               </span>
             )}
+            {deepResearchMode && <span className="mode-pill research-pill">Deep Research</span>}
             <span className="status-badge">
               <span className="live-dot" /> API Connected
             </span>
@@ -388,8 +520,14 @@ export function WorkspacePage() {
                 <Globe2 size={14} /> 网络搜索
               </button>
             </div>
-            <button className="deep-research" type="button" disabled>
-              <Sparkles size={14} /> Deep Research · Coming soon
+            <button
+              className={`deep-research ${deepResearchMode ? 'active' : ''}`}
+              type="button"
+              aria-pressed={deepResearchMode}
+              onClick={() => setDeepResearchMode((current) => !current)}
+              disabled={streaming}
+            >
+              <Sparkles size={14} /> Deep Research
             </button>
           </div>
 
@@ -422,6 +560,14 @@ export function WorkspacePage() {
 }
 
 function MessageBubble({ message }: { message: UiMessage }) {
+  const interactiveCharts = (message.researchCharts ?? []).filter(
+    (chart) => chart.echarts_option,
+  )
+  const reportCharts = (message.researchCharts ?? []).filter((chart) => chart.image_base64)
+  const hasReportPreview = Boolean(
+    message.researchReport?.trim() || message.researchSections?.length,
+  )
+
   if (message.role === 'user') {
     return (
       <div className="msg-row user-row">
@@ -439,6 +585,25 @@ function MessageBubble({ message }: { message: UiMessage }) {
           {message.content || (message.streaming ? '正在生成回答…' : '')}
           {message.streaming && <span className="cursor" />}
         </div>
+        {message.researchMode && (
+          <div className="research-output">
+            <ResearchEventPanel events={message.researchEvents ?? []} />
+            {message.researchGraph && <KnowledgeGraphView graph={message.researchGraph} />}
+            {!!interactiveCharts.length && (
+              <Suspense fallback={<div className="empty-note">图表加载中…</div>}>
+                <EChartsView charts={interactiveCharts} />
+              </Suspense>
+            )}
+            {!!reportCharts.length && <ReportChartsView charts={reportCharts} />}
+            {hasReportPreview && (
+              <ResearchReportView
+                report={message.researchReport ?? ''}
+                sections={message.researchSections ?? []}
+                references={message.researchReferences ?? []}
+              />
+            )}
+          </div>
+        )}
         {!!message.references?.length && <ReferenceList references={message.references} />}
       </div>
     </div>
@@ -489,4 +654,222 @@ function formatDate(value: string): string {
     hour: '2-digit',
     minute: '2-digit',
   }).format(date)
+}
+
+function getDeepResearchSearchFlags(searchToggle: SearchToggle): {
+  search_web: boolean
+  search_local: boolean
+} {
+  if (searchToggle === 'local') {
+    return { search_web: false, search_local: true }
+  }
+  return { search_web: true, search_local: false }
+}
+
+function getEventKnowledgeGraph(event: DeepResearchEvent): KnowledgeGraphPayload | null {
+  const content = asRecord(event.content)
+  const graph = asRecord(content.graph ?? content.knowledge_graph)
+  return normalizeKnowledgeGraph(graph)
+}
+
+function normalizeKnowledgeGraph(graph: Record<string, unknown>): KnowledgeGraphPayload | null {
+  const nodes = graph.nodes
+  const edges = graph.edges
+  if (!Array.isArray(nodes) || !Array.isArray(edges)) return null
+  return {
+    nodes: nodes
+      .map((node) => asRecord(node))
+      .filter((node) => typeof node.id === 'string')
+      .map((node) => ({
+        id: String(node.id),
+        label: typeof node.label === 'string' ? node.label : undefined,
+        name: typeof node.name === 'string' ? node.name : undefined,
+        type: typeof node.type === 'string' ? node.type : undefined,
+        importance: typeof node.importance === 'number' ? node.importance : undefined,
+        size: typeof node.size === 'number' ? node.size : undefined,
+        summary: typeof node.summary === 'string' ? node.summary : undefined,
+      })),
+    edges: edges
+      .map((edge) => asRecord(edge))
+      .filter((edge) => typeof edge.source === 'string' && typeof edge.target === 'string')
+      .map((edge) => ({
+        source: String(edge.source),
+        target: String(edge.target),
+        type: typeof edge.type === 'string' ? edge.type : undefined,
+        relation: typeof edge.relation === 'string' ? edge.relation : undefined,
+        weight: typeof edge.weight === 'number' ? edge.weight : undefined,
+        description: typeof edge.description === 'string' ? edge.description : undefined,
+      })),
+  }
+}
+
+function getEventCharts(event: DeepResearchEvent): ResearchChart[] | null {
+  const content = asRecord(event.content)
+  const rawCharts = Array.isArray(content.charts)
+    ? content.charts
+    : content.chart
+      ? [content.chart]
+      : event.type === 'chart' && typeof content.image_base64 === 'string'
+        ? [content]
+        : null
+  return normalizeResearchCharts(rawCharts)
+}
+
+function normalizeResearchCharts(rawCharts: unknown[] | null): ResearchChart[] | null {
+  if (!rawCharts) return null
+  return rawCharts
+    .map((chart) => asRecord(chart))
+    .filter((chart) => typeof chart.id === 'string' && typeof chart.title === 'string')
+    .map((chart) => ({
+      id: String(chart.id),
+      title: String(chart.title),
+      description: typeof chart.description === 'string' ? chart.description : undefined,
+      chart_type: typeof chart.chart_type === 'string' ? chart.chart_type : undefined,
+      type: typeof chart.type === 'string' ? chart.type : undefined,
+      artifact_type:
+        typeof chart.artifact_type === 'string' ? chart.artifact_type : undefined,
+      section_id: typeof chart.section_id === 'string' ? chart.section_id : null,
+      data: asOptionalRecord(chart.data),
+      echarts_option: asOptionalRecord(chart.echarts_option),
+      image_base64:
+        typeof chart.image_base64 === 'string' ? chart.image_base64 : undefined,
+      code: typeof chart.code === 'string' ? chart.code : undefined,
+      metadata: asOptionalRecord(chart.metadata),
+    }))
+}
+
+function getEventSection(event: DeepResearchEvent): ResearchReportSection | null {
+  if (event.type !== 'section_content') return null
+  const content = asRecord(event.content)
+  if (typeof content.content !== 'string') return null
+  const id = typeof content.section_id === 'string' ? content.section_id : 'section'
+  return {
+    id,
+    title: typeof content.section_title === 'string' ? content.section_title : id,
+    content: content.content,
+    word_count: typeof content.word_count === 'number' ? content.word_count : undefined,
+    key_points: Array.isArray(content.key_points)
+      ? content.key_points.map(String).filter(Boolean)
+      : undefined,
+  }
+}
+
+function getEventReport(event: DeepResearchEvent): string | null {
+  const content = asRecord(event.content)
+  if (event.type === 'report_draft' && typeof content.content === 'string') {
+    return content.content
+  }
+  if (event.type === 'done' && typeof content.final_report === 'string') {
+    return content.final_report
+  }
+  return null
+}
+
+function getEventReferences(event: DeepResearchEvent): ResearchReportReference[] | null {
+  const content = asRecord(event.content)
+  const rawReferences =
+    Array.isArray(content.references)
+      ? content.references
+      : event.type === 'report_draft' && Array.isArray(content.report_references)
+        ? content.report_references
+        : null
+  return normalizeResearchReferences(rawReferences)
+}
+
+function getResumeUiState(event: DeepResearchEvent): {
+  graph?: KnowledgeGraphPayload | null
+  charts?: ResearchChart[] | null
+  report?: string
+  references?: ResearchReportReference[] | null
+} | null {
+  if (event.type !== 'research_resumed') return null
+  const content = asRecord(event.content)
+  const uiState = asRecord(content.ui_state)
+  if (!Object.keys(uiState).length) return null
+  const report =
+    typeof uiState.final_report === 'string'
+      ? uiState.final_report
+      : typeof uiState.streaming_report === 'string'
+        ? uiState.streaming_report
+        : undefined
+  return {
+    graph: normalizeKnowledgeGraph(asRecord(uiState.knowledge_graph)),
+    charts: normalizeResearchCharts(Array.isArray(uiState.charts) ? uiState.charts : null),
+    report,
+    references: normalizeResearchReferences(
+      Array.isArray(uiState.references) ? uiState.references : null,
+    ),
+  }
+}
+
+function normalizeResearchReferences(rawReferences: unknown[] | null): ResearchReportReference[] | null {
+  if (!rawReferences) return null
+  return rawReferences
+    .map((reference) => asRecord(reference))
+    .filter((reference) => reference.source || reference.title || reference.url || reference.link)
+    .map((reference) => ({
+      id:
+        typeof reference.id === 'string' || typeof reference.id === 'number'
+          ? reference.id
+          : undefined,
+      source: typeof reference.source === 'string' ? reference.source : undefined,
+      title: typeof reference.title === 'string' ? reference.title : undefined,
+      url:
+        typeof reference.url === 'string'
+          ? reference.url
+          : typeof reference.link === 'string'
+            ? reference.link
+            : undefined,
+      author: typeof reference.author === 'string' ? reference.author : undefined,
+      date: typeof reference.date === 'string' ? reference.date : undefined,
+    }))
+}
+
+function mergeResearchCharts(
+  existingCharts: ResearchChart[],
+  incomingCharts: ResearchChart[],
+): ResearchChart[] {
+  const byId = new Map(existingCharts.map((chart) => [chart.id, chart]))
+  for (const chart of incomingCharts) {
+    byId.set(chart.id, chart)
+  }
+  return Array.from(byId.values())
+}
+
+function mergeResearchSections(
+  existingSections: ResearchReportSection[],
+  incomingSections: ResearchReportSection[],
+): ResearchReportSection[] {
+  const byId = new Map(existingSections.map((section) => [section.id, section]))
+  for (const section of incomingSections) {
+    byId.set(section.id, section)
+  }
+  return Array.from(byId.values())
+}
+
+function mergeResearchReferences(
+  existingReferences: ResearchReportReference[],
+  incomingReferences: ResearchReportReference[],
+): ResearchReportReference[] {
+  const byKey = new Map(
+    existingReferences.map((reference) => [
+      `${reference.source ?? reference.title ?? ''}|${reference.url ?? ''}`,
+      reference,
+    ]),
+  )
+  for (const reference of incomingReferences) {
+    const key = `${reference.source ?? reference.title ?? ''}|${reference.url ?? ''}`
+    byKey.set(key, reference)
+  }
+  return Array.from(byKey.values())
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+}
+
+function asOptionalRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object'
+    ? (value as Record<string, unknown>)
+    : undefined
 }

@@ -115,3 +115,84 @@ export interface WebSearchResponse {
   cached: boolean
   results: WebSearchResult[]
 }
+
+export interface DeepResearchEvent {
+  type: string
+  session_id?: string
+  agent?: string
+  phase?: string | null
+  timestamp?: string
+  content?: unknown
+  metadata?: Record<string, unknown>
+  done?: boolean
+  error?: string | null
+  checkpoint_id?: string | null
+  status?: 'running' | 'completed' | 'failed' | string | null
+}
+
+export interface ResearchStepEvent {
+  step_id?: string
+  step_type?: string
+  title?: string
+  subtitle?: string
+  status?: 'running' | 'completed' | 'failed' | string
+  started_at?: string
+  completed_at?: string
+  stats?: Record<string, unknown>
+}
+
+export interface KnowledgeGraphNode {
+  id: string
+  label?: string
+  name?: string
+  type?: string
+  importance?: number
+  size?: number
+  summary?: string
+}
+
+export interface KnowledgeGraphEdge {
+  source: string
+  target: string
+  type?: string
+  relation?: string
+  weight?: number
+  description?: string
+}
+
+export interface KnowledgeGraphPayload {
+  nodes: KnowledgeGraphNode[]
+  edges: KnowledgeGraphEdge[]
+}
+
+export interface ResearchChart {
+  id: string
+  title: string
+  description?: string
+  chart_type?: string
+  type?: string
+  artifact_type?: string
+  section_id?: string | null
+  data?: Record<string, unknown>
+  echarts_option?: Record<string, unknown>
+  image_base64?: string
+  code?: string
+  metadata?: Record<string, unknown>
+}
+
+export interface ResearchReportSection {
+  id: string
+  title: string
+  content: string
+  word_count?: number
+  key_points?: string[]
+}
+
+export interface ResearchReportReference {
+  id?: string | number
+  source?: string
+  title?: string
+  url?: string
+  author?: string
+  date?: string
+}

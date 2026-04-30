@@ -121,6 +121,22 @@ test.beforeEach(async ({ page }) => {
         `data: {"type":"done","session_id":"session-1","message_id":"${messageId}","done":true,"references":[{"index":1,"content":"来源片段","filename":"来源","score":0,"source_type":"${sourceType}","url":"https://example.com"}]}\n\n`,
     })
   })
+  await page.route('**/api/v1/deep-research/stream', async (route) => {
+    await route.fulfill({
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'text/event-stream' },
+      body:
+        'data: {"type":"research_start","agent":"DeepResearch","phase":"init","content":{"query":"分析银行业投资机会","search_web":true,"search_local":false}}\n\n' +
+        'data: {"type":"research_step","agent":"Architect","phase":"planning","content":{"title":"研究规划","status":"completed"}}\n\n' +
+        'data: {"type":"knowledge_graph","agent":"DataAnalyst","phase":"analyzing","content":{"graph":{"nodes":[{"id":"topic","label":"银行业","size":50},{"id":"nim","label":"净息差","size":44}],"edges":[{"source":"topic","target":"nim","type":"constrains"}]}}}\n\n' +
+        'data: {"type":"charts","agent":"DataAnalyst","phase":"analyzing","content":{"charts":[{"id":"chart-1","title":"资产规模","chart_type":"bar","echarts_option":{"title":{"text":"资产规模"},"xAxis":{"type":"category","data":["2025"]},"yAxis":{"type":"value"},"series":[{"type":"bar","data":[8.5]}]}}]}}\n\n' +
+        'data: {"type":"chart","agent":"Wizard","phase":"analyzing","content":{"chart":{"id":"report-chart-1","title":"净息差趋势报告图","chart_type":"generated","artifact_type":"report_image","image_base64":"iVBORw0KGgo="}}}\n\n' +
+        'data: {"type":"section_content","agent":"Writer","phase":"writing","content":{"section_id":"sec-1","section_title":"市场概况","content":"银行业资产规模增长，但净息差仍需观察。","word_count":20}}\n\n' +
+        'data: {"type":"report_draft","agent":"Writer","phase":"reviewing","content":{"content":"## 执行摘要\\n\\n银行业报告已生成，引用[测试来源](https://example.com)。\\n\\n## 风险与限制\\n\\n数据存在时点限制。","word_count":62,"references_count":1}}\n\n' +
+        'data: {"type":"review","agent":"Critic","phase":"completed","content":{"quality_score":8.6,"verdict":"pass","critical_count":0,"major_count":0,"minor_count":0}}\n\n' +
+        'data: {"type":"done","session_id":"session-1","done":true,"content":{"summary":{"facts_count":1,"charts_count":2,"report_charts_count":1,"report_word_count":62,"references_count":1,"quality_score":8.6,"unresolved_issues":0,"verdict":"pass"},"final_report":"## 执行摘要\\n\\n银行业报告已生成，引用[测试来源](https://example.com)。\\n\\n## 风险与限制\\n\\n数据存在时点限制。","references":[{"id":1,"title":"测试来源","source":"测试来源","url":"https://example.com"}]}}\n\n',
+    })
+  })
   await page.route('**/api/v1/knowledge/bases', async (route) => {
     if (route.request().method() === 'POST') {
       hasKnowledgeBase = true
@@ -241,6 +257,26 @@ test('logs in, streams chat, toggles search mode, and uploads to a knowledge bas
   await expect(page.getByRole('button', { name: '发送' })).toBeEnabled()
   await page.getByRole('button', { name: '发送' }).click()
   await expect(page.getByText('引用来源')).toBeVisible()
+
+  await page.getByRole('button', { name: 'Deep Research' }).click()
+  await page.getByPlaceholder('输入研究问题。Enter 发送，Shift+Enter 换行。').fill('分析银行业投资机会')
+  const deepResearchRequest = page.waitForRequest(
+    (request) =>
+      request.url().includes('/api/v1/deep-research/stream') &&
+      request.method() === 'POST',
+  )
+  await page.getByRole('button', { name: '发送' }).click()
+  await deepResearchRequest
+  await expect(page.getByText(/Deep Research 已完成/)).toBeVisible()
+  await expect(page.getByText('Knowledge Map')).toBeVisible()
+  await expect(page.getByText('净息差', { exact: true })).toBeVisible()
+  await expect(page.getByText('资产规模')).toBeVisible()
+  await expect(page.getByText('Report Charts')).toBeVisible()
+  await expect(page.getByRole('img', { name: '净息差趋势报告图' })).toBeVisible()
+  await expect(page.getByText('Report Draft')).toBeVisible()
+  await expect(page.getByText('报告审核完成')).toBeVisible()
+  await expect(page.getByRole('heading', { name: '执行摘要' })).toBeVisible()
+  await expect(page.getByRole('link', { name: '测试来源' }).first()).toBeVisible()
 
   await page.getByRole('button', { name: '文件' }).click()
   await page.getByPlaceholder('新建知识库分类').fill('年报库')
